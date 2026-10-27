@@ -778,18 +778,18 @@ async def upload_chunk(request):
     if not user:
         return json_err("unauthorized", 401)
     uid = request.query_params.get("id") or ""
+    try:
+        offset = int(request.query_params.get("offset") or 0)
+    except Exception:  # noqa: BLE001
+        return json_err("offset tidak valid")
+    payload = await request.body()
+    if not payload:
+        return json_err("chunk kosong")
     lock = upload_locks.setdefault(uid, asyncio.Lock())
     async with lock:
         meta = load_meta(uid)
         if not meta or meta.get("user") != user["id"]:
             return json_err("sesi upload tidak ada", 404)
-        try:
-            offset = int(request.query_params.get("offset") or 0)
-        except Exception:  # noqa: BLE001
-            return json_err("offset tidak valid")
-        payload = await request.body()
-        if not payload:
-            return json_err("chunk kosong")
         end = offset + len(payload)
         if offset < 0 or end > meta["size"]:
             return json_err("melebihi ukuran file", 413)
