@@ -713,6 +713,19 @@ def save_meta(meta):
     up_meta_path(meta["uid"]).write_text(json.dumps(meta))
 
 
+upload_locks = {}
+
+
+def merge_ranges(ranges, start, end):
+    out = []
+    for a, b in sorted(ranges + [[start, end]]):
+        if out and a <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return out
+
+
 def gc_uploads(max_age=6 * 3600):
     now = time.time()
     for p in UPLOAD_DIR.glob("*.json"):
@@ -751,6 +764,7 @@ async def upload_init(request):
         "folder": clean_folder(body.get("folder") or ""),
         "mime": body.get("mime") or mimetypes.guess_type(name)[0] or "application/octet-stream",
         "received": 0,
+        "ranges": [],
         "created": time.time(),
     }
     up_data_path(uid).write_bytes(b"")
@@ -764,25 +778,29 @@ async def upload_chunk(request):
     if not user:
         return json_err("unauthorized", 401)
     uid = request.query_params.get("id") or ""
-    meta = load_meta(uid)
-    if not meta or meta.get("user") != user["id"]:
-        return json_err("sesi upload tidak ada", 404)
-    try:
-        offset = int(request.query_params.get("offset") or 0)
-    except Exception:  # noqa: BLE001
-        return json_err("offset tidak valid")
-    if offset != meta["received"]:
-        return json_err("urutan chunk salah", 409)
-    payload = await request.body()
-    if not payload:
-        return json_err("chunk kosong")
-    if meta["received"] + len(payload) > meta["size"]:
-        return json_err("melebihi ukuran file", 413)
-    with open(up_data_path(uid), "ab") as fh:
-        fh.write(payload)
-    meta["received"] += len(payload)
-    save_meta(meta)
-    return JSONResponse({"received": meta["received"]})
+    lock = upload_locks.setdefault(uid, asyncio.Lock())
+    async with lock:
+        meta = load_meta(uid)
+        if not meta or meta.get("user") != user["id"]:
+            return json_err("sesi upload tidak ada", 404)
+        try:
+            offset = int(request.query_params.get("offset") or 0)
+        except Exception:  # noqa: BLE001
+            return json_err("offset tidak valid")
+        payload = await request.body()
+        if not payload:
+            return json_err("chunk kosong")
+        end = offset + len(payload)
+        if offset < 0 or end > meta["size"]:
+            return json_err("melebihi ukuran file", 413)
+        meta.setdefault("ranges", [])
+        meta["ranges"] = merge_ranges(meta["ranges"], offset, end)
+        meta["received"] = sum(b - a for a, b in meta["ranges"])
+        with open(up_data_path(uid), "r+b") as fh:
+            fh.seek(offset)
+            fh.write(payload)
+        save_meta(meta)
+        return JSONResponse({"received": meta["received"]})
 
 
 async def upload_status(request):
@@ -792,7 +810,9 @@ async def upload_status(request):
     meta = load_meta(request.query_params.get("id") or "")
     if not meta or meta.get("user") != user["id"]:
         return json_err("sesi upload tidak ada", 404)
-    return JSONResponse({"received": meta["received"], "size": meta["size"]})
+    return JSONResponse(
+        {"received": meta["received"], "size": meta["size"], "ranges": meta.get("ranges", [])}
+    )
 
 
 async def upload_finish(request):

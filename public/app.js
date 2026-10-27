@@ -341,38 +341,42 @@ async function uploadFiles(list) {
         }
       }
       const CH = init.chunk_size || 8 * 1024 * 1024;
-      let off = 0;
-      while (off < f.size) {
+      const totalChunks = Math.max(1, Math.ceil(f.size / CH));
+      const inflight = new Map();
+      let doneBytes = 0, nextChunk = 0, failed = null;
+      const show = () => {
+        let live = 0;
+        inflight.forEach((v) => (live += v));
+        const done = Math.min(total, sent + doneBytes + live);
+        const p = Math.min(100, Math.round((done / total) * 100));
+        fill.style.width = p + "%"; pct.textContent = p + "%";
+        const secs = Math.max(1, (Date.now() - started) / 1000);
+        const mbps = done / 1048576 / secs;
+        note.textContent = size(done) + " / " + size(total) + " · " + (mbps >= 1 ? mbps.toFixed(1) : mbps.toFixed(2)) + " MB/s";
+      };
+      const sendOne = async (idx) => {
+        const off = idx * CH;
         const part = f.slice(off, Math.min(off + CH, f.size));
-        const show = (loaded) => {
-          const done = Math.min(total, sent + loaded);
-          const p = Math.min(100, Math.round((done / total) * 100));
-          fill.style.width = p + "%"; pct.textContent = p + "%";
-          const secs = Math.max(1, (Date.now() - started) / 1000);
-          const mbps = done / 1048576 / secs;
-          note.textContent = size(done) + " / " + size(total) + " · " + (mbps >= 1 ? mbps.toFixed(1) : mbps.toFixed(2)) + " MB/s";
-        };
-        let res = null;
-        for (let t = 0; t < 4; t++) {
-          try { res = await sendChunk(init.id, off, part, show); }
-          catch { res = { ok: false, error: "koneksi putus" }; }
-          if (res.ok) break;
-          if (res.status === 409) {
-            try {
-              const st = await api("/api/upload/status?id=" + encodeURIComponent(init.id));
-              sent += Math.max(0, st.received - off);
-              off = st.received;
-            } catch {}
-            res = { ok: true, resync: true };
-            break;
-          }
-          if (res.status === 404 || res.status === 413) break;
-          await sleep(800 * (t + 1));
+        let ok = false;
+        for (let t = 0; t < 4 && !ok; t++) {
+          const res = await sendChunk(init.id, off, part, (loaded) => { inflight.set(idx, loaded); show(); });
+          if (res.ok) ok = true;
+          else if (res.status === 404 || res.status === 413) throw new Error(res.error || "upload gagal");
+          else await sleep(700 * (t + 1));
         }
-        if (!res || !res.ok) throw new Error((res && res.error) || "koneksi putus");
-        if (!res.resync) { off += part.size; sent += part.size; }
-        show(0);
-      }
+        if (!ok) throw new Error("koneksi putus");
+        inflight.delete(idx);
+        doneBytes += part.size;
+        show();
+      };
+      const worker = async () => {
+        while (nextChunk < totalChunks && !failed) {
+          const idx = nextChunk++;
+          try { await sendOne(idx); } catch (e) { failed = e; }
+        }
+      };
+      await Promise.all([worker(), worker(), worker(), worker()]);
+      if (failed) throw failed;
       note.textContent = "menyimpan…";
       last = await api("/api/upload/finish", { method: "POST", body: JSON.stringify({ id: init.id }) });
       while (last && last.retry) {
