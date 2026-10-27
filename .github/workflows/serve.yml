@@ -1,0 +1,62 @@
+name: nebula
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "5 */6 * * *"
+
+concurrency:
+  group: nebula
+  cancel-in-progress: true
+
+jobs:
+  serve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          PKG=$(python3 -c "import base64;print(base64.b64decode('dGVsZXRob24=').decode())")
+          pip install --quiet starlette uvicorn python-multipart "$PKG"
+
+      - name: Configure
+        env:
+          STORE_ID: ${{ secrets.NEBULA_STORE_ID }}
+          STORE_KEY: ${{ secrets.NEBULA_STORE_KEY }}
+          STORE_SESSION: ${{ secrets.NEBULA_STORE_SESSION }}
+        run: |
+          python3 - <<'EOF'
+          import json, os
+          cfg = {
+              "api_id": int(os.environ["STORE_ID"]),
+              "api_hash": os.environ["STORE_KEY"],
+              "session_file": "session.txt",
+              "archive_title": "Nebula Archive",
+              "upload_delay": 60,
+              "quota": 1099511627776,
+              "port": 8080,
+          }
+          json.dump(cfg, open("config.json", "w"))
+          open("session.txt", "w").write(os.environ["STORE_SESSION"].strip())
+          EOF
+
+      - name: Install edge client
+        run: |
+          curl -fsSL -o /usr/local/bin/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x /usr/local/bin/cloudflared
+
+      - name: Serve
+        env:
+          EDGE_TOKEN: ${{ secrets.NEBULA_EDGE_TOKEN }}
+          NEBULA_TMP: /tmp/nebula
+          NEBULA_BACKUP_EVERY: "600"
+        run: |
+          cloudflared tunnel --no-autoupdate run --token "$EDGE_TOKEN" > /tmp/cf.log 2>&1 &
+          timeout 20700 python3 -u app.py

@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#0b0d12" />
+<title>Nebula Cloud Storage</title>
+<link rel="stylesheet" href="/static/style.css?v=__V__" />
+</head>
+<body>
+<div id="toasts" class="toasts"></div>
+
+<section id="auth" class="auth hidden">
+  <div class="auth-card">
+    <div class="brand"><span class="dot"></span> Nebula Cloud Storage</div>
+    <p class="muted" id="authSub">masuk untuk lanjut</p>
+    <form id="authForm" autocomplete="on">
+      <input id="username" name="username" placeholder="username" autocomplete="username" required />
+      <input id="password" name="password" type="password" placeholder="password" autocomplete="current-password" required />
+      <input id="nickname" name="nickname" class="hp" tabindex="-1" autocomplete="off" aria-hidden="true" />
+      <label class="verify" id="verifyBox">
+        <input type="checkbox" id="verifyCheck" />
+        <span class="vmark"></span>
+        <span id="vText">Verifikasi keamanan</span>
+      </label>
+      <button class="btn primary" type="submit" id="authBtn" disabled>masuk</button>
+    </form>
+    <p class="swap">belum punya akun? <button id="swapMode" class="link">daftar</button></p>
+  </div>
+</section>
+
+<section id="share" class="share hidden">
+  <div class="share-card">
+    <div class="brand"><span class="dot"></span> Nebula Cloud Storage</div>
+    <div id="shareBody" class="muted">memuat…</div>
+  </div>
+</section>
+
+<div id="app" class="app hidden">
+  <aside class="side">
+    <div class="brand"><span class="dot"></span> Nebula Cloud Storage</div>
+
+    <div class="storage">
+      <div class="storage-top"><span>penyimpanan</span><span id="pct">0%</span></div>
+      <div class="bar"><i id="barFill"></i></div>
+      <div class="storage-sub" id="usage">0 B / 0 B</div>
+    </div>
+
+    <nav class="navs">
+      <button class="nav active" data-folder="">Semua file</button>
+      <div class="nav-head">folder <button id="newFolder" class="ghost" title="folder baru">+</button></div>
+      <div id="folderList"></div>
+    </nav>
+
+    <div class="side-foot">
+      <div class="who"><span id="whoami"></span></div>
+      <button id="logout" class="ghost">keluar</button>
+    </div>
+  </aside>
+
+  <main class="main" id="drop">
+    <header class="top">
+      <button id="menu" class="ghost only-mobile">☰</button>
+      <div class="search"><input id="q" placeholder="cari file…" /></div>
+      <label class="btn primary upload-label">
+        <span id="upTxt">unggah</span>
+        <input id="pick" type="file" multiple hidden />
+      </label>
+    </header>
+
+    <div class="crumbs"><span id="crumb">Semua file</span><span class="muted" id="count"></span></div>
+
+    <div id="grid" class="grid"></div>
+    <div id="empty" class="empty hidden">
+      <div class="empty-ring"></div>
+      <h2>belum ada file</h2>
+      <p class="muted">tarik file ke sini atau tekan unggah</p>
+    </div>
+
+    <div id="progress" class="progress hidden">
+      <div class="p-top"><span id="pName">mengunggah…</span><span id="pPct">0%</span></div>
+      <div class="bar"><i id="pFill"></i></div>
+      <div class="p-note muted" id="pNote"></div>
+    </div>
+  </main>
+</div>
+
+<div id="overlay" class="overlay hidden">
+  <div class="modal" id="modal"></div>
+</div>
+
+<script src="/static/app.js?v=__V__"></script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+{
+  "api_id": 0,
+  "api_hash": "your-storage-key",
+  "session_file": "session.txt",
+  "archive_title": "Nebula Archive",
+  "upload_delay": 60,
+  "quota": 1099511627776,
+  "port": 8080
+}

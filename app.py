@@ -1,0 +1,910 @@
+import asyncio
+import hashlib
+import hmac
+import json
+import mimetypes
+import os
+import re
+import secrets
+import shutil
+import sqlite3
+import time
+from collections import defaultdict, deque
+from contextlib import asynccontextmanager
+from pathlib import Path
+from urllib.parse import quote
+
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
+from starlette.routing import Mount, Route
+from starlette.staticfiles import StaticFiles
+
+from store import (
+    Client,
+    CreateForumTopicRequest,
+    DocumentAttributeFilename,
+    MessageActionTopicCreate,
+    StringSession,
+    functions,
+)
+
+BASE = Path(__file__).resolve().parent
+CFG = json.loads((BASE / "config.json").read_text())
+DB_PATH = os.environ.get("NEBULA_DB", str(BASE / "data.db"))
+TMP = Path(os.environ.get("NEBULA_TMP", str(BASE / "tmp")))
+TMP.mkdir(parents=True, exist_ok=True)
+DELAY = int(os.environ.get("NEBULA_UPLOAD_DELAY", CFG.get("upload_delay", 60)))
+QUOTA = int(os.environ.get("NEBULA_QUOTA", CFG.get("quota", 2 * 1024**3)))
+MAX_FILE = 2 * 1024**3 - 1024
+POW_BITS = int(os.environ.get("NEBULA_POW_BITS", "20"))
+INVITE = os.environ.get("NEBULA_INVITE", "")
+CHALLENGES = {}
+HITS = defaultdict(deque)
+COOKIE = "nd"
+BACKUP_EVERY = int(os.environ.get("NEBULA_BACKUP_EVERY", "600"))
+BACKUP_NAME = "nebula.db"
+
+SCHEMA = """
+    PRAGMA journal_mode=WAL;
+    CREATE TABLE IF NOT EXISTS users(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        salt TEXT NOT NULL,
+        hash TEXT NOT NULL,
+        topic_id INTEGER,
+        created_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS sessions(
+        token TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        expires INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS files(
+        id TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        mime TEXT NOT NULL,
+        msg_id INTEGER NOT NULL,
+        folder TEXT NOT NULL DEFAULT '',
+        share_token TEXT UNIQUE,
+        created_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS folders(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        UNIQUE(user_id, name)
+    );
+    CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT NOT NULL);
+    CREATE INDEX IF NOT EXISTS idx_files_user ON files(user_id, folder);
+    """
+
+db = None
+
+
+def open_db():
+    global db
+    db = sqlite3.connect(DB_PATH, check_same_thread=False)
+    db.row_factory = sqlite3.Row
+    db.executescript(SCHEMA)
+
+
+def reopen_db():
+    global db
+    try:
+        db.close()
+    except Exception:  # noqa: BLE001
+        pass
+    open_db()
+
+
+open_db()
+
+
+def kv_get(k, default=None):
+    row = db.execute("SELECT v FROM kv WHERE k=?", (k,)).fetchone()
+    return row["v"] if row else default
+
+
+def kv_set(k, v):
+    db.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, str(v)))
+    db.commit()
+
+
+def hash_pw(password, salt=None):
+    salt = salt or secrets.token_hex(16)
+    h = hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt), n=2**14, r=8, p=1, dklen=32)
+    return salt, h.hex()
+
+
+def check_pw(password, salt, expected):
+    _, h = hash_pw(password, salt)
+    return hmac.compare_digest(h, expected)
+
+
+def user_used(uid):
+    return db.execute("SELECT COALESCE(SUM(size),0) AS s FROM files WHERE user_id=?", (uid,)).fetchone()["s"]
+
+
+def clean_name(name):
+    name = (name or "file").replace("\\", "_").replace("/", "_")
+    name = re.sub(r"[\x00-\x1f]", "", name).strip()
+    return (name or "file")[:180]
+
+
+def cookies(request):
+    raw = request.headers.get("cookie", "")
+    out = {}
+    for part in raw.split(";"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def current_user(request):
+    token = cookies(request).get(COOKIE)
+    if not token:
+        return None
+    row = db.execute(
+        "SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.expires>?",
+        (token, int(time.time())),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def fnv1a(text):
+    h = 0x811C9DC5
+    for b in text.encode():
+        h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
+    return h
+
+
+def issue_challenge():
+    now = time.time()
+    for seed in [k for k, v in CHALLENGES.items() if v[0] < now]:
+        CHALLENGES.pop(seed, None)
+    seed = secrets.token_hex(8)
+    CHALLENGES[seed] = (now + 600, POW_BITS)
+    return seed, POW_BITS
+
+
+def check_pow(token):
+    try:
+        seed, nonce = str(token).split(":", 1)
+    except ValueError:
+        return False
+    ent = CHALLENGES.pop(seed, None)
+    if not ent or ent[0] < time.time():
+        return False
+    mask = (1 << ent[1]) - 1
+    return (fnv1a(seed + nonce) & mask) == 0
+
+
+def client_ip(request):
+    return (
+        request.headers.get("cf-connecting-ip")
+        or (request.headers.get("x-forwarded-for", "").split(",")[0].strip())
+        or (request.client.host if request.client else "?")
+    )
+
+
+def rate_limited(key, limit, window):
+    now = time.time()
+    q = HITS[key]
+    while q and q[0] < now - window:
+        q.popleft()
+    if len(q) >= limit:
+        return True
+    q.append(now)
+    return False
+
+
+def json_err(msg, code=400):
+    return JSONResponse({"error": msg}, status_code=code)
+
+
+class Tg:
+    def __init__(self):
+        self.client = None
+        self.vault = None
+        self.forum = False
+        self.ready = False
+        self.error = None
+
+    async def start(self):
+        try:
+            session = open(CFG["session_file"]).read().strip()
+            self.client = Client(
+                StringSession(session), CFG["api_id"], CFG["api_hash"], device_model="Nebula", system_version="1.0"
+            )
+            await self.client.connect()
+            if not await self.client.is_user_authorized():
+                self.error = "storage node not authorized"
+                return
+            await self.ensure_vault()
+            if await self.restore_db():
+                reopen_db()
+            self.ready = True
+            print("[store] ready vault=", self.vault.id, flush=True)
+        except Exception as exc:  # noqa: BLE001
+            self.error = "storage node unavailable"
+            print("[store] start failed:", type(exc).__name__, flush=True)
+
+    async def restore_db(self):
+        try:
+            msgs = await self.client.get_messages(self.vault, limit=100)
+        except Exception as exc:  # noqa: BLE001
+            print("[db] restore scan failed:", repr(exc)[:120], flush=True)
+            return False
+        best = None
+        for m in msgs:
+            f = getattr(m, "file", None)
+            if f and getattr(f, "name", None) == BACKUP_NAME:
+                best = m
+                break
+        if not best:
+            return False
+        tmp = TMP / "restore.db"
+        await self.client.download_media(best, file=str(tmp))
+        for suffix in ("-wal", "-shm"):
+            Path(str(DB_PATH) + suffix).unlink(missing_ok=True)
+        os.replace(tmp, DB_PATH)
+        print("[db] restored from msg", best.id, flush=True)
+        return True
+
+    async def backup_db(self):
+        if not self.vault:
+            return None
+        snap = TMP / "snap.db"
+        snap.unlink(missing_ok=True)
+        src = sqlite3.connect(DB_PATH)
+        out = sqlite3.connect(str(snap))
+        try:
+            src.backup(out)
+        finally:
+            out.close()
+            src.close()
+        msg = await self.client.send_file(
+            self.vault,
+            str(snap),
+            caption="nebula db",
+            force_document=True,
+            attributes=[DocumentAttributeFilename(file_name=BACKUP_NAME)],
+            parse_mode=None,
+        )
+        snap.unlink(missing_ok=True)
+        await self.prune_backups(keep=3, current=msg.id)
+        print("[db] backup msg", msg.id, flush=True)
+        return msg.id
+
+    async def prune_backups(self, keep=3, current=None):
+        msgs = await self.client.get_messages(self.vault, limit=100)
+        ids = [
+            m.id
+            for m in msgs
+            if getattr(getattr(m, "file", None), "name", None) == BACKUP_NAME
+        ]
+        old = [i for i in ids[keep:] if i != current]
+        if old:
+            await self.client.delete_messages(self.vault, old)
+
+    async def ensure_vault(self):
+        chat_id = kv_get("vault_id")
+        title = CFG.get("archive_title") or CFG.get("vault_title") or "Nebula Archive"
+        if chat_id:
+            try:
+                self.vault = await self.client.get_entity(int(chat_id))
+                await self.enable_forum()
+                return
+            except Exception:  # noqa: BLE001
+                pass
+        async for d in self.client.iter_dialogs():
+            if d.is_group and d.name == title:
+                self.vault = d.entity
+                kv_set("vault_id", self.vault.id)
+                await self.enable_forum()
+                return
+        res = await self.client(
+            functions.channels.CreateChannelRequest(
+                title=title,
+                about="private storage for nebula",
+                megagroup=True,
+            )
+        )
+        self.vault = res.chats[0]
+        kv_set("vault_id", self.vault.id)
+        await self.enable_forum()
+        print("[store] vault created", self.vault.id, flush=True)
+
+    async def enable_forum(self):
+        try:
+            await self.client(
+                functions.channels.ToggleForumRequest(channel=self.vault, enabled=True, tabs=True)
+            )
+            self.forum = True
+        except Exception as exc:  # noqa: BLE001
+            print("[store] forum toggle failed:", type(exc).__name__, flush=True)
+            self.forum = False
+        return self.forum
+
+    async def ensure_topic(self, user):
+        if user.get("topic_id"):
+            return user["topic_id"]
+        if not self.vault:
+            return None
+        try:
+            res = await self.client(
+                CreateForumTopicRequest(
+                    peer=self.vault,
+                    title=f"{user['username']} #{user['id']}"[:100],
+                    random_id=secrets.randbits(62),
+                )
+            )
+            topic = None
+            for upd in getattr(res, "updates", []) or []:
+                msg = getattr(upd, "message", None)
+                if msg is not None and isinstance(getattr(msg, "action", None), MessageActionTopicCreate):
+                    topic = msg.id
+                    break
+            if topic is None:
+                msgs = await self.client.get_messages(self.vault, limit=1)
+                topic = msgs[0].id if msgs else None
+            db.execute("UPDATE users SET topic_id=? WHERE id=?", (topic, user["id"]))
+            db.commit()
+            return topic
+        except Exception as exc:  # noqa: BLE001
+            print("[store] topic failed:", type(exc).__name__, flush=True)
+            try:
+                if await self.enable_forum():
+                    return await self.ensure_topic(user)
+            except Exception:  # noqa: BLE001
+                pass
+            return None
+
+    async def upload(self, user, path, name, mime):
+        topic = await self.ensure_topic(user)
+        caption = f"uid:{user['id']} | {name}"
+        kwargs = dict(
+            caption=caption,
+            force_document=True,
+            attributes=[DocumentAttributeFilename(file_name=name)],
+            supports_streaming=True,
+            parse_mode=None,
+        )
+        if topic:
+            kwargs["reply_to"] = topic
+        msg = await self.client.send_file(self.vault, str(path), **kwargs)
+        return msg.id
+
+    async def media(self, msg_id):
+        msg = await self.client.get_messages(self.vault, ids=int(msg_id))
+        if not msg or not msg.media:
+            return None
+        return msg
+
+    def download_iter(self, msg, start=0, length=None):
+        aligned = start - (start % 4096)
+        skip = start - aligned
+        return self.client.iter_download(
+            msg.media,
+            offset=aligned,
+            limit=None if length is None else length + skip,
+            request_size=512 * 1024,
+            chunk_size=512 * 1024,
+        )
+
+
+tg = Tg()
+
+
+user_locks = defaultdict(asyncio.Lock)
+user_next = {}
+tg_slots = asyncio.Semaphore(3)
+
+
+async def do_upload(user, path, name, mime):
+    if not tg.ready:
+        raise RuntimeError("storage worker belum siap")
+    uid = user["id"]
+    async with user_locks[uid]:
+        wait = user_next.get(uid, 0) - time.time()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        async with tg_slots:
+            msg_id = await tg.upload(user, path, name, mime)
+        user_next[uid] = time.time() + DELAY
+    return msg_id
+
+
+INDEX_HTML = (BASE / "public" / "index.html").read_text()
+
+
+def asset_ver():
+    h = hashlib.md5()
+    for name in ("app.js", "style.css"):
+        h.update(str((BASE / "public" / name).stat().st_mtime_ns).encode())
+    return h.hexdigest()[:8]
+
+
+async def index(request):
+    resp = HTMLResponse(INDEX_HTML.replace("__V__", asset_ver()))
+    resp.headers["cache-control"] = "no-cache"
+    return resp
+
+
+async def health(request):
+    return JSONResponse(
+        {
+            "ok": tg.ready,
+            "error": tg.error,
+            "delay": DELAY,
+            "queue": sum(1 for l in user_locks.values() if l.locked()),
+        }
+    )
+
+
+async def challenge_endpoint(request):
+    seed, bits = issue_challenge()
+    return JSONResponse({"seed": seed, "bits": bits, "invite": bool(INVITE)})
+
+
+async def register(request):
+    body = await request.json()
+    if (body.get("nickname") or "").strip():
+        return json_err("ditolak", 400)
+    ip = client_ip(request)
+    if rate_limited("reg:" + ip, 6, 3600):
+        return json_err("terlalu banyak percobaan, coba lagi nanti", 429)
+    if not check_pow(body.get("pow") or ""):
+        return json_err("verifikasi gagal, muat ulang halaman", 400)
+    if INVITE and (body.get("invite") or "").strip() != INVITE:
+        return json_err("kode undangan salah", 403)
+    username = (body.get("username") or "").strip().lower()
+    password = body.get("password") or ""
+    if not re.fullmatch(r"[a-z0-9_.-]{3,24}", username):
+        return json_err("username 3-24 huruf/angka/._-")
+    if len(password) < 6:
+        return json_err("password minimal 6 karakter")
+    if db.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
+        return json_err("username sudah dipakai", 409)
+    salt, h = hash_pw(password)
+    cur = db.execute(
+        "INSERT INTO users(username,salt,hash,created_at) VALUES(?,?,?,?)",
+        (username, salt, h, int(time.time())),
+    )
+    db.commit()
+    uid = cur.lastrowid
+    user = dict(db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone())
+    if tg.ready:
+        await tg.ensure_topic(user)
+    return await login_user(request, uid)
+
+
+async def login(request):
+    body = await request.json()
+    if (body.get("nickname") or "").strip():
+        return json_err("ditolak", 400)
+    ip = client_ip(request)
+    if rate_limited("login:" + ip, 30, 600):
+        return json_err("terlalu banyak percobaan, tunggu sebentar", 429)
+    username = (body.get("username") or "").strip().lower()
+    if rate_limited("login:" + ip + ":" + username, 8, 600):
+        return json_err("terlalu banyak percobaan untuk akun ini", 429)
+    if not check_pow(body.get("pow") or ""):
+        return json_err("verifikasi gagal, muat ulang halaman", 400)
+    password = body.get("password") or ""
+    row = db.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+    if not row or not check_pw(password, row["salt"], row["hash"]):
+        return json_err("username atau password salah", 401)
+    return await login_user(request, row["id"])
+
+
+async def login_user(request, uid):
+    token = secrets.token_urlsafe(32)
+    db.execute(
+        "INSERT INTO sessions(token,user_id,expires) VALUES(?,?,?)",
+        (token, uid, int(time.time()) + 30 * 86400),
+    )
+    db.commit()
+    user = dict(db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone())
+    resp = JSONResponse(me_payload(user))
+    resp.set_cookie(COOKIE, token, max_age=30 * 86400, httponly=True, samesite="lax", path="/")
+    return resp
+
+
+def me_payload(user):
+    used = user_used(user["id"])
+    return {
+        "id": user["id"],
+        "username": user["username"],
+        "used": used,
+        "quota": QUOTA,
+        "count": db.execute("SELECT COUNT(*) c FROM files WHERE user_id=?", (user["id"],)).fetchone()["c"],
+    }
+
+
+async def logout(request):
+    token = cookies(request).get(COOKIE)
+    if token:
+        db.execute("DELETE FROM sessions WHERE token=?", (token,))
+        db.commit()
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(COOKIE, path="/")
+    return resp
+
+
+async def me(request):
+    user = current_user(request)
+    if not user:
+        return json_err("unauthorized", 401)
+    return JSONResponse(me_payload(user))
+
+
+async def list_files(request):
+    user = current_user(request)
+    if not user:
+        return json_err("unauthorized", 401)
+    folder = request.query_params.get("folder", "")
+    q = (request.query_params.get("q") or "").strip()
+    sql = "SELECT id,name,size,mime,folder,share_token,created_at FROM files WHERE user_id=? AND folder=?"
+    args = [user["id"], folder]
+    if q:
+        sql += " AND name LIKE ?"
+        args.append(f"%{q}%")
+    sql += " ORDER BY created_at DESC"
+    files = [dict(r) for r in db.execute(sql, args).fetchall()]
+    folders = [
+        dict(r)
+        for r in db.execute(
+            "SELECT id,name FROM folders WHERE user_id=? ORDER BY name", (user["id"],)
+        ).fetchall()
+    ]
+    return JSONResponse({"files": files, "folders": folders, "del": DELAY})
+
+
+async def upload(request):
+    user = current_user(request)
+    if not user:
+        return json_err("unauthorized", 401)
+    if not tg.ready:
+        return json_err(f"storage belum siap: {tg.error}", 503)
+    form = await request.form()
+    folder = clean_name(form.get("folder") or "") if form.get("folder") else ""
+    uploads = [f for f in form.getlist("files") if getattr(f, "filename", None)]
+    if not uploads:
+        return json_err("tidak ada file")
+    used = user_used(user["id"])
+    already = db.execute("SELECT COUNT(*) c FROM files WHERE user_id=?", (user["id"],)).fetchone()["c"]
+    out = []
+    for up in uploads:
+        name = clean_name(up.filename)
+        tmp = TMP / f"{secrets.token_hex(8)}.part"
+        size = 0
+        with open(tmp, "wb") as fh:
+            while True:
+                chunk = await up.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if used + size > QUOTA:
+                    fh.close()
+                    tmp.unlink(missing_ok=True)
+                    return json_err("kuota penuh", 413)
+                if size > MAX_FILE:
+                    fh.close()
+                    tmp.unlink(missing_ok=True)
+                    return json_err("maksimal 2 GB per file", 413)
+                fh.write(chunk)
+        if size == 0:
+            tmp.unlink(missing_ok=True)
+            continue
+        mime = up.content_type or mimetypes.guess_type(name)[0] or "application/octet-stream"
+        try:
+            msg_id = await do_upload(user, str(tmp), name, mime)
+        except Exception as exc:  # noqa: BLE001
+            Path(tmp).unlink(missing_ok=True)
+            return json_err(f"upload gagal: {exc}", 502)
+        fid = secrets.token_hex(8)
+        db.execute(
+            "INSERT INTO files(id,user_id,name,size,mime,msg_id,folder,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (fid, user["id"], name, size, mime, msg_id, folder, int(time.time())),
+        )
+        db.commit()
+        used += size
+        already += 1
+        out.append({"id": fid, "name": name, "size": size, "mime": mime, "folder": folder})
+    return JSONResponse({"files": out, "me": me_payload(user), "delay": DELAY})
+
+
+def get_file(fid, user_id=None, share=None):
+    if share:
+        return db.execute("SELECT * FROM files WHERE share_token=?", (share,)).fetchone()
+    return db.execute("SELECT * FROM files WHERE id=? AND user_id=?", (fid, user_id)).fetchone()
+
+
+def disposition(name, inline):
+    kind = "inline" if inline else "attachment"
+    return f"{kind}; filename*=UTF-8''{quote(name)}"
+
+
+async def send_file(request, row, inline=False):
+    try:
+        msg = await tg.media(row["msg_id"])
+    except Exception as exc:  # noqa: BLE001
+        return json_err(f"gagal ambil file: {exc}", 502)
+    if not msg:
+        return json_err("file tidak ada di storage", 404)
+    size = row["size"]
+    mime = row["mime"] or "application/octet-stream"
+    start, end, status = 0, size - 1, 200
+    rng = request.headers.get("range")
+    if rng:
+        m = re.match(r"bytes=(\d*)-(\d*)", rng)
+        if m:
+            if m.group(1):
+                start = int(m.group(1))
+            if m.group(2):
+                end = min(int(m.group(2)), size - 1)
+            if start > end or start >= size:
+                return Response(status_code=416, headers={"Content-Range": f"bytes */{size}"})
+            status = 206
+    length = end - start + 1
+    headers = {
+        "Content-Type": mime,
+        "Content-Disposition": disposition(row["name"], inline),
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(length),
+        "Cache-Control": "private, max-age=3600",
+    }
+    if status == 206:
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+
+    async def body():
+        produced = 0
+        skip = start % 4096
+        async for chunk in tg.download_iter(msg, start, length):
+            if skip:
+                if len(chunk) <= skip:
+                    skip -= len(chunk)
+                    continue
+                chunk = chunk[skip:]
+                skip = 0
+            if produced + len(chunk) > length:
+                chunk = chunk[: length - produced]
+            produced += len(chunk)
+            if chunk:
+                yield chunk
+            if produced >= length:
+                break
+
+    return StreamingResponse(body(), status_code=status, headers=headers)
+
+
+async def download(request):
+    user = current_user(request)
+    if not user:
+        return json_err("unauthorized", 401)
+    row = get_file(request.path_params["fid"], user["id"])
+    if not row:
+        return json_err("not found", 404)
+    return await send_file(request, row, inline=False)
+
+
+async def view(request):
+    user = current_user(request)
+    if not user:
+        return json_err("unauthorized", 401)
+    row = get_file(request.path_params["fid"], user["id"])
+    if not row:
+        return json_err("not found", 404)
+    return await send_file(request, row, inline=True)
+
+
+async def share_info(request):
+    row = get_file(None, share=request.path_params["token"])
+    if not row:
+        return json_err("not found", 404)
+    return JSONResponse(
+        {"name": row["name"], "size": row["size"], "mime": row["mime"], "created_at": row["created_at"]}
+    )
+
+
+async def share_download(request):
+    row = get_file(None, share=request.path_params["token"])
+    if not row:
+        return json_err("not found", 404)
+    return await send_file(request, row, inline=request.path_params["token"] in request.url.path and request.query_params.get("inline") == "1")
+
+
+async def rename(request):
+    user = current_user(request)
+    if not user:
+        return json_err("unauthorized", 401)
+    row = get_file(request.path_params["fid"], user["id"])
+    if not row:
+        return json_err("not found", 404)
+    body = await request.json()
+    name = clean_name(body.get("name"))
+    folder = clean_name(body.get("folder")) if body.get("folder") is not None else row["folder"]
+    db.execute("UPDATE files SET name=?, folder=? WHERE id=?", (name, folder, row["id"]))
+    db.commit()
+    return JSONResponse({"ok": True, "name": name, "folder": folder})
+
+
+async def delete(request):
+    user = current_user(request)
+    if not user:
+        return json_err("unauthorized", 401)
+    row = get_file(request.path_params["fid"], user["id"])
+    if not row:
+        return json_err("not found", 404)
+    db.execute("DELETE FROM files WHERE id=?", (row["id"],))
+    db.commit()
+    try:
+        if tg.ready and tg.vault:
+            await tg.client.delete_messages(tg.vault, [row["msg_id"]])
+    except Exception as exc:  # noqa: BLE001
+        print("[store] delete failed:", type(exc).__name__, flush=True)
+    return JSONResponse({"ok": True, "me": me_payload(user)})
+
+
+async def share(request):
+    user = current_user(request)
+    if not user:
+        return json_err("unauthorized", 401)
+    row = get_file(request.path_params["fid"], user["id"])
+    if not row:
+        return json_err("not found", 404)
+    token = row["share_token"] or secrets.token_urlsafe(12)
+    db.execute("UPDATE files SET share_token=? WHERE id=?", (token, row["id"]))
+    db.commit()
+    return JSONResponse({"token": token})
+
+
+async def unshare(request):
+    user = current_user(request)
+    if not user:
+        return json_err("unauthorized", 401)
+    row = get_file(request.path_params["fid"], user["id"])
+    if not row:
+        return json_err("not found", 404)
+    db.execute("UPDATE files SET share_token=NULL WHERE id=?", (row["id"],))
+    db.commit()
+    return JSONResponse({"ok": True})
+
+
+async def folders(request):
+    user = current_user(request)
+    if not user:
+        return json_err("unauthorized", 401)
+    if request.method == "POST":
+        body = await request.json()
+        name = clean_name(body.get("name"))
+        if not name:
+            return json_err("nama folder kosong")
+        db.execute(
+            "INSERT OR IGNORE INTO folders(user_id,name,created_at) VALUES(?,?,?)",
+            (user["id"], name, int(time.time())),
+        )
+        db.commit()
+        return JSONResponse({"ok": True, "name": name})
+    rows = db.execute("SELECT id,name FROM folders WHERE user_id=? ORDER BY name", (user["id"],)).fetchall()
+    return JSONResponse({"folders": [dict(r) for r in rows]})
+
+
+async def folder_delete(request):
+    user = current_user(request)
+    if not user:
+        return json_err("unauthorized", 401)
+    fid = int(request.path_params["fid"])
+    row = db.execute("SELECT * FROM folders WHERE id=? AND user_id=?", (fid, user["id"])).fetchone()
+    if not row:
+        return json_err("not found", 404)
+    db.execute("DELETE FROM folders WHERE id=?", (fid,))
+    db.execute("UPDATE files SET folder='' WHERE user_id=? AND folder=?", (user["id"], row["name"]))
+    db.commit()
+    return JSONResponse({"ok": True})
+
+
+@asynccontextmanager
+async def lifespan(app):
+    await tg.start()
+    stop = asyncio.Event()
+
+    async def backup_loop():
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=BACKUP_EVERY)
+                return
+            except asyncio.TimeoutError:
+                pass
+            try:
+                await tg.backup_db()
+            except Exception as exc:  # noqa: BLE001
+                print("[db] backup failed:", repr(exc)[:160], flush=True)
+
+    task = None
+    if tg.ready:
+        try:
+            await tg.backup_db()
+        except Exception as exc:  # noqa: BLE001
+            print("[db] initial backup failed:", repr(exc)[:160], flush=True)
+        if BACKUP_EVERY > 0:
+            task = asyncio.create_task(backup_loop())
+    try:
+        yield
+    finally:
+        stop.set()
+        if task:
+            task.cancel()
+        try:
+            if tg.ready:
+                await asyncio.wait_for(tg.backup_db(), 25)
+        except Exception:  # noqa: BLE001
+            pass
+        if tg.client:
+            await tg.client.disconnect()
+
+
+app = Starlette(
+    routes=[
+        Route("/", index),
+        Route("/s/{token}", index),
+        Route("/api/health", health),
+        Route("/api/challenge", challenge_endpoint),
+        Route("/api/register", register, methods=["POST"]),
+        Route("/api/login", login, methods=["POST"]),
+        Route("/api/logout", logout, methods=["POST"]),
+        Route("/api/me", me),
+        Route("/api/files", list_files),
+        Route("/api/upload", upload, methods=["POST"]),
+        Route("/api/file/{fid}/download", download),
+        Route("/api/file/{fid}/view", view),
+        Route("/api/file/{fid}", rename, methods=["PATCH"]),
+        Route("/api/file/{fid}", delete, methods=["DELETE"]),
+        Route("/api/file/{fid}/share", share, methods=["POST"]),
+        Route("/api/file/{fid}/share", unshare, methods=["DELETE"]),
+        Route("/api/folders", folders, methods=["GET", "POST"]),
+        Route("/api/folders/{fid}", folder_delete, methods=["DELETE"]),
+        Route("/api/share/{token}", share_info),
+        Route("/api/share/{token}/download", share_download),
+        Mount("/static", StaticFiles(directory=BASE / "public")),
+    ],
+    lifespan=lifespan,
+)
+
+class NoCacheStatic:
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http" and scope.get("path", "").startswith("/static"):
+            async def _send(message):
+                if message["type"] == "http.response.start":
+                    headers = message.setdefault("headers", [])
+                    headers[:] = [(k, v) for k, v in headers if k.lower() != b"cache-control"]
+                    headers.append((b"cache-control", b"no-cache"))
+                await send(message)
+
+            await self.inner(scope, receive, _send)
+        else:
+            await self.inner(scope, receive, send)
+
+
+app = NoCacheStatic(app)
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", CFG.get("port", 8080))), log_level="info")
