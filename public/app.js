@@ -283,41 +283,74 @@ async function delFolder(id) {
 }
 
 /* ---------- upload ---------- */
-function uploadFiles(list) {
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+async function sendChunk(id, offset, blob) {
+  const r = await fetch("/api/upload/chunk?id=" + encodeURIComponent(id) + "&offset=" + offset, {
+    method: "POST",
+    headers: { "content-type": "application/octet-stream" },
+    body: blob,
+    credentials: "same-origin",
+  });
+  if (r.ok) return { ok: true };
+  const d = await r.json().catch(() => ({}));
+  return { ok: false, status: r.status, error: d.error || "upload gagal" };
+}
+
+async function uploadFiles(list) {
   if (!list || !list.length) return;
-  const fd = new FormData();
-  [...list].forEach((f) => fd.append("files", f));
-  if (state.folder) fd.append("folder", state.folder);
-
   const bar = $("#progress"), fill = $("#pFill"), pct = $("#pPct"), nm = $("#pName"), note = $("#pNote");
+  const files = [...list];
+  const total = files.reduce((a, f) => a + f.size, 0) || 1;
+  let sent = 0, last = null;
   bar.classList.remove("hidden");
-  nm.textContent = list.length > 1 ? list.length + " file" : list[0].name;
-  note.textContent = "jeda " + (window.NEBULA_DELAY || 60) + " detik per user setelah upload";
   fill.style.width = "0%"; pct.textContent = "0%";
-
-  const xhr = new XMLHttpRequest();
-  xhr.open("POST", "/api/upload");
-  xhr.upload.onprogress = (e) => {
-    if (!e.lengthComputable) return;
-    const p = Math.round((e.loaded / e.total) * 100);
-    fill.style.width = p + "%"; pct.textContent = p + "%";
-    if (p >= 100) { pct.textContent = "100%"; nm.textContent = "selesai kirim"; note.textContent = "diproses…"; }
-  };
-  xhr.onload = () => {
+  note.textContent = "mengunggah " + size(total);
+  try {
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i];
+      nm.textContent = files.length > 1 ? (i + 1) + "/" + files.length + " · " + f.name : f.name;
+      const init = await api("/api/upload/init", {
+        method: "POST",
+        body: JSON.stringify({ name: f.name, size: f.size, folder: state.folder, mime: f.type || "" }),
+      });
+      const CH = init.chunk_size || 24 * 1024 * 1024;
+      let off = 0;
+      while (off < f.size) {
+        const part = f.slice(off, Math.min(off + CH, f.size));
+        let res = null;
+        for (let t = 0; t < 4; t++) {
+          try { res = await sendChunk(init.id, off, part); }
+          catch { res = { ok: false, error: "koneksi putus" }; }
+          if (res.ok) break;
+          if (res.status === 409) {
+            try { off = (await api("/api/upload/status?id=" + encodeURIComponent(init.id))).received; } catch {}
+            res = { ok: true, resync: true };
+            break;
+          }
+          if (res.status === 404 || res.status === 413) break;
+          await sleep(800 * (t + 1));
+        }
+        if (!res || !res.ok) throw new Error((res && res.error) || "koneksi putus");
+        if (!res.resync) { off += part.size; sent += part.size; }
+        const p = Math.min(100, Math.round((sent / total) * 100));
+        fill.style.width = p + "%"; pct.textContent = p + "%";
+      }
+      note.textContent = "menyimpan…";
+      last = await api("/api/upload/finish", { method: "POST", body: JSON.stringify({ id: init.id }) });
+      if (last.me) setMe(last.me);
+    }
     bar.classList.add("hidden");
-    try {
-      const d = JSON.parse(xhr.responseText);
-      if (xhr.status >= 400) throw new Error(d.error || "upload gagal");
-      setMe(d.me);
-      loadFiles();
-      toast(d.files.length + " file terunggah");
-      state.delay = d.delay || state.delay;
-      startCooldown(state.delay);
-    } catch (e) { toast(e.message, 1); }
-    $("#pick").value = "";
-  };
-  xhr.onerror = () => { bar.classList.add("hidden"); toast("koneksi putus", 1); };
-  xhr.send(fd);
+    loadFiles();
+    toast(files.length + " file terunggah");
+    state.delay = (last && last.delay) || state.delay;
+    startCooldown(state.delay);
+  } catch (e) {
+    bar.classList.add("hidden");
+    toast(e.message || "upload gagal", 1);
+    loadFiles();
+  }
+  $("#pick").value = "";
 }
 
 let cdTimer = null;

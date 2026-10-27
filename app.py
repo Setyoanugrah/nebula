@@ -591,6 +591,158 @@ async def list_files(request):
     return JSONResponse({"files": files, "folders": folders, "del": DELAY})
 
 
+UPLOAD_CHUNK = 24 * 1024 * 1024
+UPLOAD_DIR = TMP / "up"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def up_meta_path(uid):
+    return UPLOAD_DIR / (uid + ".json")
+
+
+def up_data_path(uid):
+    return UPLOAD_DIR / (uid + ".part")
+
+
+def load_meta(uid):
+    p = up_meta_path(uid)
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def save_meta(meta):
+    up_meta_path(meta["uid"]).write_text(json.dumps(meta))
+
+
+def gc_uploads(max_age=6 * 3600):
+    now = time.time()
+    for p in UPLOAD_DIR.glob("*.json"):
+        try:
+            if now - p.stat().st_mtime > max_age:
+                p.unlink(missing_ok=True)
+                p.with_suffix(".part").unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def upload_init(request):
+    user = current_user(request)
+    if not user:
+        return json_err("unauthorized", 401)
+    if not tg.ready:
+        return json_err("storage belum siap", 503)
+    body = await request.json()
+    name = clean_name(body.get("name") or "")
+    try:
+        size = int(body.get("size") or 0)
+    except Exception:  # noqa: BLE001
+        size = 0
+    if not name or size <= 0:
+        return json_err("file tidak valid")
+    if size > MAX_FILE:
+        return json_err("maksimal 2 GB per file", 413)
+    if user_used(user["id"]) + size > QUOTA:
+        return json_err("kuota penuh", 413)
+    uid = secrets.token_hex(12)
+    meta = {
+        "uid": uid,
+        "user": user["id"],
+        "name": name,
+        "size": size,
+        "folder": clean_name(body.get("folder") or ""),
+        "mime": body.get("mime") or mimetypes.guess_type(name)[0] or "application/octet-stream",
+        "received": 0,
+        "created": time.time(),
+    }
+    up_data_path(uid).write_bytes(b"")
+    save_meta(meta)
+    return JSONResponse({"id": uid, "chunk_size": UPLOAD_CHUNK})
+
+
+async def upload_chunk(request):
+    user = current_user(request)
+    if not user:
+        return json_err("unauthorized", 401)
+    uid = request.query_params.get("id") or ""
+    meta = load_meta(uid)
+    if not meta or meta.get("user") != user["id"]:
+        return json_err("sesi upload tidak ada", 404)
+    try:
+        offset = int(request.query_params.get("offset") or 0)
+    except Exception:  # noqa: BLE001
+        return json_err("offset tidak valid")
+    if offset != meta["received"]:
+        return json_err("urutan chunk salah", 409)
+    payload = await request.body()
+    if not payload:
+        return json_err("chunk kosong")
+    if meta["received"] + len(payload) > meta["size"]:
+        return json_err("melebihi ukuran file", 413)
+    with open(up_data_path(uid), "ab") as fh:
+        fh.write(payload)
+    meta["received"] += len(payload)
+    save_meta(meta)
+    return JSONResponse({"received": meta["received"]})
+
+
+async def upload_status(request):
+    user = current_user(request)
+    if not user:
+        return json_err("unauthorized", 401)
+    meta = load_meta(request.query_params.get("id") or "")
+    if not meta or meta.get("user") != user["id"]:
+        return json_err("sesi upload tidak ada", 404)
+    return JSONResponse({"received": meta["received"], "size": meta["size"]})
+
+
+async def upload_finish(request):
+    user = current_user(request)
+    if not user:
+        return json_err("unauthorized", 401)
+    body = await request.json()
+    uid = body.get("id") or ""
+    meta = load_meta(uid)
+    if not meta or meta.get("user") != user["id"]:
+        return json_err("sesi upload tidak ada", 404)
+    if meta["received"] != meta["size"]:
+        return json_err("upload belum lengkap", 409)
+    if user_used(user["id"]) + meta["size"] > QUOTA:
+        return json_err("kuota penuh", 413)
+    path = up_data_path(uid)
+    try:
+        msg_id = await do_upload(user, str(path), meta["name"], meta["mime"])
+    except Exception:  # noqa: BLE001
+        up_meta_path(uid).unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
+        return json_err("upload gagal, coba lagi", 502)
+    fid = secrets.token_hex(8)
+    db.execute(
+        "INSERT INTO files(id,user_id,name,size,mime,msg_id,folder,created_at) VALUES(?,?,?,?,?,?,?,?)",
+        (fid, user["id"], meta["name"], meta["size"], meta["mime"], msg_id, meta["folder"], int(time.time())),
+    )
+    db.commit()
+    path.unlink(missing_ok=True)
+    up_meta_path(uid).unlink(missing_ok=True)
+    asyncio.create_task(safe_backup())
+    return JSONResponse(
+        {
+            "file": {
+                "id": fid,
+                "name": meta["name"],
+                "size": meta["size"],
+                "mime": meta["mime"],
+                "folder": meta["folder"],
+            },
+            "me": me_payload(user),
+            "delay": DELAY,
+        }
+    )
+
+
 async def upload(request):
     user = current_user(request)
     if not user:
@@ -837,6 +989,7 @@ async def folder_delete(request):
 
 @asynccontextmanager
 async def lifespan(app):
+    gc_uploads()
     await tg.start()
     stop = asyncio.Event()
 
@@ -887,6 +1040,10 @@ app = Starlette(
         Route("/api/me", me),
         Route("/api/files", list_files),
         Route("/api/upload", upload, methods=["POST"]),
+        Route("/api/upload/init", upload_init, methods=["POST"]),
+        Route("/api/upload/chunk", upload_chunk, methods=["POST"]),
+        Route("/api/upload/status", upload_status, methods=["GET"]),
+        Route("/api/upload/finish", upload_finish, methods=["POST"]),
         Route("/api/file/{fid}/download", download),
         Route("/api/file/{fid}/view", view),
         Route("/api/file/{fid}", rename, methods=["PATCH"]),
