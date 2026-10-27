@@ -1089,6 +1089,7 @@ async def lifespan(app):
                 await tg.backup_db()
             except Exception as exc:  # noqa: BLE001
                 print("[db] backup failed:", repr(exc)[:160], flush=True)
+            gc_uploads(3600)
 
     task = None
     if tg.ready:
