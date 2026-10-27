@@ -686,7 +686,7 @@ async def list_files(request):
     return JSONResponse({"files": files, "folders": folders, "del": DELAY})
 
 
-UPLOAD_CHUNK = 8 * 1024 * 1024
+UPLOAD_CHUNK = 4 * 1024 * 1024
 UPLOAD_DIR = TMP / "up"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 

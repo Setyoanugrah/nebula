@@ -325,7 +325,7 @@ function sendChunk(id, offset, blob, onProgress) {
       resolve(v);
     };
     const wd = setInterval(() => {
-      if (Date.now() - last > 30000) {
+      if (Date.now() - last > 20000) {
         try { xhr.abort(); } catch {}
         done({ ok: false, error: "koneksi macet" });
       }
@@ -374,7 +374,7 @@ async function uploadFiles(list) {
           await sleep(1000);
         }
       }
-      const CH = init.chunk_size || 8 * 1024 * 1024;
+      const CH = init.chunk_size || 4 * 1024 * 1024;
       const totalChunks = Math.max(1, Math.ceil(f.size / CH));
       const inflight = new Map();
       let doneBytes = 0;
@@ -412,7 +412,7 @@ async function uploadFiles(list) {
             try { await sendOne(idx); } catch (e) { failed = e; }
           }
         };
-        await Promise.all([worker(), worker(), worker(), worker()]);
+        await Promise.all([worker(), worker()]);
         if (failed) throw failed;
       };
       let indices = Array.from({ length: totalChunks }, (_, i) => i);
