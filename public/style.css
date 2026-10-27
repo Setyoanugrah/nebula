@@ -133,3 +133,5 @@ a{color:var(--acc2)}
 .limit-note{position:fixed;top:14px;left:50%;transform:translate(-50%,-14px);z-index:60;background:rgba(17,21,32,.94);border:1px solid var(--line);color:#cfd6e6;font-size:12px;padding:8px 15px;border-radius:999px;backdrop-filter:blur(10px);box-shadow:0 12px 32px rgba(0,0,0,.45);opacity:0;pointer-events:none;white-space:nowrap;transition:opacity .3s,transform .3s;max-width:calc(100vw - 28px);overflow:hidden;text-overflow:ellipsis}
 .limit-note.show{opacity:1;transform:translate(-50%,0)}
 @media(max-width:520px){.limit-note{font-size:11px;padding:7px 12px}}
+.badge.wip{background:rgba(251,191,36,.16);color:#fbbf24}
+.badge.fail{background:rgba(248,113,113,.16);color:#f87171}

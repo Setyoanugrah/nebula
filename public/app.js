@@ -144,22 +144,35 @@ function render() {
 
   files.forEach((f) => {
     const [cls, svg] = iconFor(f.name, f.mime);
+    const ready = (f.status || "ready") === "ready";
     const isImg = (f.mime || "").startsWith("image/");
+    const badge =
+      f.status === "pending"
+        ? '<span class="badge wip">memproses</span>'
+        : f.status === "failed"
+        ? '<span class="badge fail">gagal</span>'
+        : f.share_token
+        ? '<span class="badge">dibagikan</span>'
+        : "";
     const el = document.createElement("div");
     el.className = "card";
     el.innerHTML = `
-      <div class="thumb ${isImg ? "" : "t-icon-" + cls}" data-preview="${f.id}">
-        ${isImg ? `<img loading="lazy" src="/api/file/${f.id}/view" alt="">` : svg}
-        ${f.share_token ? '<span class="badge">dibagikan</span>' : ""}
+      <div class="thumb ${isImg && ready ? "" : "t-icon-" + cls}" ${ready ? `data-preview="${f.id}"` : ""}>
+        ${isImg && ready ? `<img loading="lazy" src="/api/file/${f.id}/view" alt="">` : svg}
+        ${badge}
       </div>
       <div class="meta">
         <div class="name" title="${esc(f.name)}">${esc(f.name)}</div>
         <div class="sub"><span>${size(f.size)}</span><span>${when(f.created_at)}</span></div>
       </div>
       <div class="actions">
-        <a class="act" href="/api/file/${f.id}/download" title="unduh">${I.download}</a>
+        ${
+          ready
+            ? `<a class="act" href="/api/file/${f.id}/download" title="unduh">${I.download}</a>
         <button class="act" data-share="${f.id}" title="bagikan">${I.share}</button>
-        <button class="act" data-rename="${f.id}" title="ganti nama">${I.edit}</button>
+        <button class="act" data-rename="${f.id}" title="ganti nama">${I.edit}</button>`
+            : ""
+        }
         <button class="act del" data-del="${f.id}" title="hapus">${I.trash}</button>
       </div>`;
     grid.append(el);
@@ -373,7 +386,8 @@ async function uploadFiles(list) {
     }
     bar.classList.add("hidden");
     loadFiles();
-    toast(files.length + " file terunggah");
+    startPendingPoll();
+    toast(files.length + " file dikirim, diproses di server");
     state.delay = (last && last.delay) || state.delay;
     startCooldown(state.delay);
   } catch (e) {
@@ -382,6 +396,17 @@ async function uploadFiles(list) {
     loadFiles();
   }
   $("#pick").value = "";
+}
+
+let pendingTimer = null;
+function startPendingPoll() {
+  clearInterval(pendingTimer);
+  pendingTimer = setInterval(async () => {
+    try {
+      await loadFiles();
+      if (!state.files.some((f) => f.status === "pending")) clearInterval(pendingTimer);
+    } catch {}
+  }, 4000);
 }
 
 let cdTimer = null;

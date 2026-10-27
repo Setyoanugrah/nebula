@@ -630,7 +630,7 @@ async def list_files(request):
         return json_err("unauthorized", 401)
     folder = request.query_params.get("folder", "")
     q = (request.query_params.get("q") or "").strip()
-    sql = "SELECT id,name,size,mime,folder,share_token,created_at FROM files WHERE user_id=? AND folder=?"
+    sql = "SELECT id,name,size,mime,folder,share_token,created_at,status,msg_id FROM files WHERE user_id=? AND folder=?"
     args = [user["id"], folder]
     if q:
         sql += " AND name LIKE ?"
@@ -771,21 +771,13 @@ async def upload_finish(request):
     wait = user_next.get(user["id"], 0) - time.time()
     if wait > 2:
         return JSONResponse({"retry": True, "wait": int(wait) + 1})
-    path = up_data_path(uid)
-    try:
-        msg_id = await do_upload(user, str(path), meta["name"], meta["mime"])
-    except Exception:  # noqa: BLE001
-        up_meta_path(uid).unlink(missing_ok=True)
-        path.unlink(missing_ok=True)
-        return json_err("upload gagal, coba lagi", 502)
     fid = secrets.token_hex(8)
     db.execute(
-        "INSERT INTO files(id,user_id,name,size,mime,msg_id,folder,created_at) VALUES(?,?,?,?,?,?,?,?)",
-        (fid, user["id"], meta["name"], meta["size"], meta["mime"], msg_id, meta["folder"], int(time.time())),
+        "INSERT INTO files(id,user_id,name,size,mime,msg_id,folder,created_at,status) VALUES(?,?,?,?,?,?,?,?,?)",
+        (fid, user["id"], meta["name"], meta["size"], meta["mime"], 0, meta["folder"], int(time.time()), "pending"),
     )
     db.commit()
-    path.unlink(missing_ok=True)
-    up_meta_path(uid).unlink(missing_ok=True)
+    asyncio.create_task(store_pending(fid, user["id"], uid, meta["name"], meta["mime"]))
     asyncio.create_task(safe_backup())
     return JSONResponse(
         {
@@ -795,11 +787,30 @@ async def upload_finish(request):
                 "size": meta["size"],
                 "mime": meta["mime"],
                 "folder": meta["folder"],
+                "status": "pending",
             },
             "me": me_payload(user),
             "delay": DELAY,
         }
     )
+
+
+async def store_pending(fid, user_id, meta_id, name, mime):
+    path = up_data_path(meta_id)
+    try:
+        user = dict(db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone())
+        msg_id = await do_upload(user, str(path), name, mime)
+        db.execute("UPDATE files SET msg_id=?, status='ready' WHERE id=?", (msg_id, fid))
+        db.commit()
+        asyncio.create_task(safe_backup())
+        print("[store] filed", fid, "msg", msg_id, flush=True)
+    except Exception as exc:  # noqa: BLE001
+        db.execute("UPDATE files SET status='failed' WHERE id=?", (fid,))
+        db.commit()
+        print("[store] store failed", fid, type(exc).__name__, flush=True)
+    finally:
+        path.unlink(missing_ok=True)
+        up_meta_path(meta_id).unlink(missing_ok=True)
 
 
 async def upload(request):
@@ -856,6 +867,16 @@ async def upload(request):
     return JSONResponse({"files": out, "me": me_payload(user), "delay": DELAY})
 
 
+def migrate():
+    cols = {r["name"] for r in db.execute("PRAGMA table_info(files)").fetchall()}
+    if "status" not in cols:
+        db.execute("ALTER TABLE files ADD COLUMN status TEXT DEFAULT 'ready'")
+        db.commit()
+    db.execute("UPDATE files SET status='ready' WHERE status IS NULL")
+    db.execute("UPDATE files SET status='failed' WHERE status='pending' AND (msg_id IS NULL OR msg_id=0)")
+    db.commit()
+
+
 def get_file(fid, user_id=None, share=None):
     if share:
         return db.execute("SELECT * FROM files WHERE share_token=?", (share,)).fetchone()
@@ -868,6 +889,10 @@ def disposition(name, inline):
 
 
 async def send_file(request, row, inline=False):
+    if not row["msg_id"]:
+        if (row["status"] or "") == "failed":
+            return json_err("file gagal diproses, hapus lalu upload ulang", 409)
+        return json_err("file masih diproses, coba lagi sebentar", 409)
     try:
         msg = await tg.media(row["msg_id"])
     except Exception as exc:  # noqa: BLE001
@@ -1050,6 +1075,7 @@ async def folder_delete(request):
 async def lifespan(app):
     gc_uploads()
     await tg.start()
+    migrate()
     stop = asyncio.Event()
 
     async def backup_loop():
