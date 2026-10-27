@@ -470,9 +470,6 @@ async def do_upload(user, path, name, mime):
         raise RuntimeError("storage worker belum siap")
     uid = user["id"]
     async with user_locks[uid]:
-        wait = user_next.get(uid, 0) - time.time()
-        if wait > 0:
-            await asyncio.sleep(wait)
         async with tg_slots:
             try:
                 msg_id = await asyncio.wait_for(tg.upload(user, path, name, mime), timeout=300)
