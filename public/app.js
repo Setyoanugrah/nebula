@@ -101,7 +101,6 @@ function showLimitNote() {
   const n = $("#limitNote");
   if (!n) return;
   requestAnimationFrame(() => n.classList.add("show"));
-  setTimeout(() => n.classList.remove("show"), 9000);
 }
 
 function setMe(me) {
