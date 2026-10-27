@@ -309,9 +309,10 @@ async function uploadFiles(list) {
   const files = [...list];
   const total = files.reduce((a, f) => a + f.size, 0) || 1;
   let sent = 0, last = null;
+  const started = Date.now();
   bar.classList.remove("hidden");
   fill.style.width = "0%"; pct.textContent = "0%";
-  note.textContent = "mengunggah " + size(total);
+  note.textContent = "0 / " + size(total);
   try {
     for (let i = 0; i < files.length; i++) {
       const f = files[i];
@@ -325,8 +326,12 @@ async function uploadFiles(list) {
       while (off < f.size) {
         const part = f.slice(off, Math.min(off + CH, f.size));
         const show = (loaded) => {
-          const p = Math.min(100, Math.round(((sent + loaded) / total) * 100));
+          const done = Math.min(total, sent + loaded);
+          const p = Math.min(100, Math.round((done / total) * 100));
           fill.style.width = p + "%"; pct.textContent = p + "%";
+          const secs = Math.max(1, (Date.now() - started) / 1000);
+          const mbps = done / 1048576 / secs;
+          note.textContent = size(done) + " / " + size(total) + " · " + (mbps >= 1 ? mbps.toFixed(1) : mbps.toFixed(2)) + " MB/s";
         };
         let res = null;
         for (let t = 0; t < 4; t++) {
