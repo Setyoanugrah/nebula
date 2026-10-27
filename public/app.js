@@ -300,18 +300,37 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 function sendChunk(id, offset, blob, onProgress) {
   return new Promise((resolve) => {
+    let settled = false;
     const xhr = new XMLHttpRequest();
+    let last = Date.now();
+    const done = (v) => {
+      if (settled) return;
+      settled = true;
+      clearInterval(wd);
+      resolve(v);
+    };
+    const wd = setInterval(() => {
+      if (Date.now() - last > 30000) {
+        try { xhr.abort(); } catch {}
+        done({ ok: false, error: "koneksi macet" });
+      }
+    }, 5000);
     xhr.open("POST", "/api/upload/chunk?id=" + encodeURIComponent(id) + "&offset=" + offset);
     xhr.setRequestHeader("content-type", "application/octet-stream");
-    xhr.upload.onprogress = (e) => { if (e.lengthComputable && onProgress) onProgress(e.loaded); };
+    xhr.timeout = 90000;
+    xhr.upload.onprogress = (e) => {
+      last = Date.now();
+      if (e.lengthComputable && onProgress) onProgress(e.loaded);
+    };
     xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) return resolve({ ok: true });
+      if (xhr.status >= 200 && xhr.status < 300) return done({ ok: true });
       let d = {};
       try { d = JSON.parse(xhr.responseText); } catch {}
-      resolve({ ok: false, status: xhr.status, error: d.error || "upload gagal" });
+      done({ ok: false, status: xhr.status, error: d.error || "upload gagal" });
     };
-    xhr.onerror = () => resolve({ ok: false, error: "koneksi putus" });
-    xhr.onabort = () => resolve({ ok: false, error: "dibatalkan" });
+    xhr.onerror = () => done({ ok: false, error: "koneksi putus" });
+    xhr.onabort = () => done({ ok: false, error: "dibatalkan" });
+    xhr.ontimeout = () => done({ ok: false, error: "timeout" });
     xhr.send(blob);
   });
 }
@@ -343,7 +362,7 @@ async function uploadFiles(list) {
       const CH = init.chunk_size || 8 * 1024 * 1024;
       const totalChunks = Math.max(1, Math.ceil(f.size / CH));
       const inflight = new Map();
-      let doneBytes = 0, nextChunk = 0, failed = null;
+      let doneBytes = 0;
       const show = () => {
         let live = 0;
         inflight.forEach((v) => (live += v));
@@ -358,7 +377,7 @@ async function uploadFiles(list) {
         const off = idx * CH;
         const part = f.slice(off, Math.min(off + CH, f.size));
         let ok = false;
-        for (let t = 0; t < 4 && !ok; t++) {
+        for (let t = 0; t < 6 && !ok; t++) {
           const res = await sendChunk(init.id, off, part, (loaded) => { inflight.set(idx, loaded); show(); });
           if (res.ok) ok = true;
           else if (res.status === 404 || res.status === 413) throw new Error(res.error || "upload gagal");
@@ -369,23 +388,42 @@ async function uploadFiles(list) {
         doneBytes += part.size;
         show();
       };
-      const worker = async () => {
-        while (nextChunk < totalChunks && !failed) {
-          const idx = nextChunk++;
-          try { await sendOne(idx); } catch (e) { failed = e; }
-        }
+      const runWave = async (indices) => {
+        inflight.clear();
+        let cursor = 0, failed = null;
+        const worker = async () => {
+          while (cursor < indices.length && !failed) {
+            const idx = indices[cursor++];
+            try { await sendOne(idx); } catch (e) { failed = e; }
+          }
+        };
+        await Promise.all([worker(), worker(), worker(), worker()]);
+        if (failed) throw failed;
       };
-      await Promise.all([worker(), worker(), worker(), worker()]);
-      if (failed) throw failed;
-      note.textContent = "menyimpan…";
-      last = await api("/api/upload/finish", { method: "POST", body: JSON.stringify({ id: init.id }) });
-      while (last && last.retry) {
-        for (let left = last.wait; left > 0; left--) {
-          note.textContent = "menunggu antrean · " + left + "s";
-          await sleep(1000);
+      let indices = Array.from({ length: totalChunks }, (_, i) => i);
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await runWave(indices);
+          break;
+        } catch (e) {
+          if (attempt >= 2) throw e;
+          note.textContent = "menyambung ulang…";
+          await sleep(2500);
+          const st = await api("/api/upload/status?id=" + encodeURIComponent(init.id));
+          const ranges = st.ranges || [];
+          indices = [];
+          for (let i = 0; i < totalChunks; i++) {
+            const a = i * CH, b = Math.min(a + CH, f.size);
+            if (!ranges.some(([x, y]) => x <= a && b <= y)) indices.push(i);
+          }
+          doneBytes = st.received || 0;
+          show();
+          if (!indices.length) break;
         }
-        last = await api("/api/upload/finish", { method: "POST", body: JSON.stringify({ id: init.id }) });
       }
+      sent += f.size;
+      doneBytes = 0;
+      inflight.clear();
       if (last.me) setMe(last.me);
     }
     bar.classList.add("hidden");
