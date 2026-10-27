@@ -87,6 +87,21 @@ async function solveChallenge() {
   }
 }
 
+async function apiRetry(path, opts = {}, tries = 4) {
+  let last;
+  for (let i = 0; i < tries; i++) {
+    try { return await api(path, opts); }
+    catch (e) {
+      last = e;
+      const msg = String((e && e.message) || "");
+      const net = e instanceof TypeError || /fetch|network|load failed|macet|dibatalkan|timeout|putus/i.test(msg);
+      if (!net) throw e;
+      await sleep(900 * (i + 1));
+    }
+  }
+  throw last;
+}
+
 async function api(path, opts = {}) {
   const r = await fetch(path, { headers: { "content-type": "application/json" }, ...opts });
   const d = await r.json().catch(() => ({}));
@@ -349,7 +364,7 @@ async function uploadFiles(list) {
     for (let i = 0; i < files.length; i++) {
       const f = files[i];
       nm.textContent = files.length > 1 ? (i + 1) + "/" + files.length + " · " + f.name : f.name;
-      const init = await api("/api/upload/init", {
+      const init = await apiRetry("/api/upload/init", {
         method: "POST",
         body: JSON.stringify({ name: f.name, size: f.size, folder: state.folder, mime: f.type || "" }),
       });
@@ -409,7 +424,7 @@ async function uploadFiles(list) {
           if (attempt >= 2) throw e;
           note.textContent = "menyambung ulang…";
           await sleep(2500);
-          const st = await api("/api/upload/status?id=" + encodeURIComponent(init.id));
+          const st = await apiRetry("/api/upload/status?id=" + encodeURIComponent(init.id));
           const ranges = st.ranges || [];
           indices = [];
           for (let i = 0; i < totalChunks; i++) {
@@ -424,6 +439,15 @@ async function uploadFiles(list) {
       sent += f.size;
       doneBytes = 0;
       inflight.clear();
+      note.textContent = "menyimpan…";
+      last = await apiRetry("/api/upload/finish", { method: "POST", body: JSON.stringify({ id: init.id }) });
+      while (last && last.retry) {
+        for (let left = last.wait; left > 0; left--) {
+          note.textContent = "menunggu antrean · " + left + "s";
+          await sleep(1000);
+        }
+        last = await apiRetry("/api/upload/finish", { method: "POST", body: JSON.stringify({ id: init.id }) });
+      }
       if (last.me) setMe(last.me);
     }
     bar.classList.add("hidden");

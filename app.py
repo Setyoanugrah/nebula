@@ -828,6 +828,24 @@ async def upload_finish(request):
         return json_err("upload belum lengkap", 409)
     if user_used(user["id"]) + meta["size"] > QUOTA:
         return json_err("kuota penuh", 413)
+    fid_prev = meta.get("file_id")
+    if fid_prev:
+        row = db.execute("SELECT * FROM files WHERE id=?", (fid_prev,)).fetchone()
+        if row:
+            return JSONResponse(
+                {
+                    "file": {
+                        "id": row["id"],
+                        "name": row["name"],
+                        "size": row["size"],
+                        "mime": row["mime"],
+                        "folder": row["folder"],
+                        "status": row["status"],
+                    },
+                    "me": me_payload(user),
+                    "delay": DELAY,
+                }
+            )
     wait = user_next.get(user["id"], 0) - time.time()
     if wait > 2:
         return JSONResponse({"retry": True, "wait": int(wait) + 1})
@@ -837,6 +855,8 @@ async def upload_finish(request):
         (fid, user["id"], meta["name"], meta["size"], meta["mime"], 0, meta["folder"], int(time.time()), "pending"),
     )
     db.commit()
+    meta["file_id"] = fid
+    save_meta(meta)
     asyncio.create_task(store_pending(fid, user["id"], uid, meta["name"], meta["mime"]))
     asyncio.create_task(safe_backup())
     return JSONResponse(
@@ -870,7 +890,6 @@ async def store_pending(fid, user_id, meta_id, name, mime):
         print("[store] store failed", fid, type(exc).__name__, flush=True)
     finally:
         path.unlink(missing_ok=True)
-        up_meta_path(meta_id).unlink(missing_ok=True)
 
 
 async def upload(request):
