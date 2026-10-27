@@ -94,9 +94,20 @@ async function api(path, opts = {}) {
   return d;
 }
 
+let limitShown = false;
+function showLimitNote() {
+  if (limitShown) return;
+  limitShown = true;
+  const n = $("#limitNote");
+  if (!n) return;
+  requestAnimationFrame(() => n.classList.add("show"));
+  setTimeout(() => n.classList.remove("show"), 9000);
+}
+
 function setMe(me) {
   state.me = me;
   if (!me) return;
+  showLimitNote();
   $("#whoami").textContent = "@" + me.username;
   const p = me.quota ? Math.min(100, (me.used / me.quota) * 100) : 0;
   $("#pct").textContent = p.toFixed(p < 10 && p > 0 ? 1 : 0) + "%";
