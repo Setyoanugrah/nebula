@@ -88,7 +88,20 @@ SCHEMA = """
         UNIQUE(user_id, name)
     );
     CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS apikeys(
+        id TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        prefix TEXT NOT NULL,
+        hash TEXT UNIQUE NOT NULL,
+        scope TEXT NOT NULL DEFAULT 'full',
+        created_at INTEGER NOT NULL,
+        last_used INTEGER NOT NULL DEFAULT 0,
+        last_ip TEXT NOT NULL DEFAULT '',
+        uses INTEGER NOT NULL DEFAULT 0
+    );
     CREATE INDEX IF NOT EXISTS idx_files_user ON files(user_id, folder);
+    CREATE INDEX IF NOT EXISTS idx_keys_user ON apikeys(user_id);
     """
 
 db = None
@@ -161,6 +174,9 @@ def cookies(request):
 
 
 def current_user(request):
+    key_user, _key = key_auth(request)
+    if key_user:
+        return key_user
     token = cookies(request).get(COOKIE)
     if not token:
         return None
@@ -169,6 +185,151 @@ def current_user(request):
         (token, int(time.time())),
     ).fetchone()
     return dict(row) if row else None
+
+
+# ---------- api keys ----------
+
+KEY_PREFIX = "nbla"
+KEY_BODY_LEN = 32
+KEY_ALPHABET = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+KEY_SCOPES = ("full", "read")
+MAX_KEYS = 10
+
+
+def key_hash(raw):
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def new_key():
+    return KEY_PREFIX + "".join(secrets.choice(KEY_ALPHABET) for _ in range(KEY_BODY_LEN))
+
+
+def key_raw(request):
+    auth = (request.headers.get("authorization") or "").strip()
+    if auth[:7].lower() == "bearer ":
+        return auth[7:].strip()
+    for h in ("x-api-key", "api-key", "x-nebula-key"):
+        v = (request.headers.get(h) or "").strip()
+        if v:
+            return v
+    return (request.query_params.get("key") or "").strip()
+
+
+def key_auth(request):
+    cached = request.scope.get("nebula_key")
+    if cached is not None:
+        return cached if cached != False else (None, None)
+    raw = key_raw(request)
+    if not raw or not raw.startswith(KEY_PREFIX) or len(raw) != len(KEY_PREFIX) + KEY_BODY_LEN:
+        request.scope["nebula_key"] = False
+        return None, None
+    row = db.execute("SELECT * FROM apikeys WHERE hash=?", (key_hash(raw),)).fetchone()
+    if not row:
+        request.scope["nebula_key"] = False
+        return None, None
+    user = db.execute("SELECT * FROM users WHERE id=?", (row["user_id"],)).fetchone()
+    if not user:
+        request.scope["nebula_key"] = False
+        return None, None
+    now = int(time.time())
+    if now - int(row["last_used"] or 0) > 30:
+        try:
+            db.execute(
+                "UPDATE apikeys SET last_used=?, uses=uses+1, last_ip=? WHERE id=?",
+                (now, client_ip(request), row["id"]),
+            )
+            db.commit()
+        except Exception:  # noqa: BLE001
+            pass
+    out = (dict(user), row)
+    request.scope["nebula_key"] = out
+    return out
+
+
+def key_public(row):
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "prefix": row["prefix"],
+        "scope": row["scope"],
+        "created_at": row["created_at"],
+        "last_used": row["last_used"],
+        "uses": row["uses"],
+        "last_ip": row["last_ip"],
+    }
+
+
+async def keys_endpoint(request):
+    if key_auth(request)[1]:
+        return json_err("kelola api key hanya dari sesi web, bukan dari api key", 403)
+    user = current_user(request)
+    if not user:
+        return json_err("unauthorized", 401)
+    if request.method == "GET":
+        rows = db.execute(
+            "SELECT * FROM apikeys WHERE user_id=? ORDER BY created_at DESC", (user["id"],)
+        ).fetchall()
+        return JSONResponse({"keys": [key_public(r) for r in rows], "max": MAX_KEYS})
+    body = await request.json()
+    name = clean_name(body.get("name") or "").strip() or "api key"
+    scope = (body.get("scope") or "full").strip().lower()
+    if scope not in KEY_SCOPES:
+        return json_err("scope harus full atau read")
+    total = db.execute("SELECT COUNT(*) c FROM apikeys WHERE user_id=?", (user["id"],)).fetchone()["c"]
+    if total >= MAX_KEYS:
+        return json_err(f"maksimal {MAX_KEYS} api key, cabut dulu yang lama", 409)
+    raw = new_key()
+    kid = secrets.token_hex(8)
+    db.execute(
+        "INSERT INTO apikeys(id,user_id,name,prefix,hash,scope,created_at) VALUES(?,?,?,?,?,?,?)",
+        (kid, user["id"], name[:60], raw[:8], key_hash(raw), scope, int(time.time())),
+    )
+    db.commit()
+    row = db.execute("SELECT * FROM apikeys WHERE id=?", (kid,)).fetchone()
+    return JSONResponse({"key": raw, "info": key_public(row)})
+
+
+async def key_detail(request):
+    if key_auth(request)[1]:
+        return json_err("kelola api key hanya dari sesi web, bukan dari api key", 403)
+    user = current_user(request)
+    if not user:
+        return json_err("unauthorized", 401)
+    kid = request.path_params["kid"]
+    row = db.execute("SELECT * FROM apikeys WHERE id=? AND user_id=?", (kid, user["id"])).fetchone()
+    if not row:
+        return json_err("not found", 404)
+    if request.method == "DELETE":
+        db.execute("DELETE FROM apikeys WHERE id=?", (kid,))
+        db.commit()
+        return JSONResponse({"ok": True})
+    body = await request.json()
+    name = row["name"]
+    scope = row["scope"]
+    if body.get("name") is not None:
+        name = (clean_name(body.get("name")) or row["name"])[:60]
+    if body.get("scope") is not None:
+        s = str(body.get("scope")).strip().lower()
+        if s not in KEY_SCOPES:
+            return json_err("scope harus full atau read")
+        scope = s
+    db.execute("UPDATE apikeys SET name=?, scope=? WHERE id=?", (name, scope, kid))
+    db.commit()
+    row = db.execute("SELECT * FROM apikeys WHERE id=?", (kid,)).fetchone()
+    return JSONResponse({"ok": True, "info": key_public(row)})
+
+
+def key_scope(request):
+    _user, key = key_auth(request)
+    return key["scope"] if key else "session"
+
+
+def readonly_blocked(request):
+    return JSONResponse(
+        {"error": "api key ini read-only, pakai key scope full untuk menulis"}, status_code=403
+    )
+
+
 
 
 def fnv1a(text):
@@ -665,7 +826,16 @@ async def me(request):
     user = current_user(request)
     if not user:
         return json_err("unauthorized", 401)
-    return JSONResponse(me_payload(user))
+    payload = me_payload(user)
+    _u, key = key_auth(request)
+    payload["auth"] = "key" if key else "session"
+    if key:
+        payload["key"] = {
+            "id": key["id"],
+            "name": key["name"],
+            "scope": key["scope"],
+        }
+    return JSONResponse(payload)
 
 
 async def list_files(request):
@@ -745,6 +915,8 @@ async def upload_init(request):
     user = current_user(request)
     if not user:
         return json_err("unauthorized", 401)
+    if key_scope(request) == "read":
+        return readonly_blocked(request)
     if not tg.ready:
         return json_err("storage belum siap", 503)
     body = await request.json()
@@ -781,6 +953,8 @@ async def upload_chunk(request):
     user = current_user(request)
     if not user:
         return json_err("unauthorized", 401)
+    if key_scope(request) == "read":
+        return readonly_blocked(request)
     uid = request.query_params.get("id") or ""
     try:
         offset = int(request.query_params.get("offset") or 0)
@@ -823,6 +997,8 @@ async def upload_finish(request):
     user = current_user(request)
     if not user:
         return json_err("unauthorized", 401)
+    if key_scope(request) == "read":
+        return readonly_blocked(request)
     body = await request.json()
     uid = body.get("id") or ""
     meta = load_meta(uid)
@@ -909,6 +1085,8 @@ async def upload(request):
     user = current_user(request)
     if not user:
         return json_err("unauthorized", 401)
+    if key_scope(request) == "read":
+        return readonly_blocked(request)
     if not tg.ready:
         return json_err(f"storage belum siap: {tg.error}", 503)
     form = await request.form()
@@ -1077,6 +1255,8 @@ async def rename(request):
     user = current_user(request)
     if not user:
         return json_err("unauthorized", 401)
+    if key_scope(request) == "read":
+        return readonly_blocked(request)
     row = get_file(request.path_params["fid"], user["id"])
     if not row:
         return json_err("not found", 404)
@@ -1092,6 +1272,8 @@ async def delete(request):
     user = current_user(request)
     if not user:
         return json_err("unauthorized", 401)
+    if key_scope(request) == "read":
+        return readonly_blocked(request)
     row = get_file(request.path_params["fid"], user["id"])
     if not row:
         return json_err("not found", 404)
@@ -1109,6 +1291,8 @@ async def share(request):
     user = current_user(request)
     if not user:
         return json_err("unauthorized", 401)
+    if key_scope(request) == "read":
+        return readonly_blocked(request)
     row = get_file(request.path_params["fid"], user["id"])
     if not row:
         return json_err("not found", 404)
@@ -1122,6 +1306,8 @@ async def unshare(request):
     user = current_user(request)
     if not user:
         return json_err("unauthorized", 401)
+    if key_scope(request) == "read":
+        return readonly_blocked(request)
     row = get_file(request.path_params["fid"], user["id"])
     if not row:
         return json_err("not found", 404)
@@ -1135,6 +1321,8 @@ async def folders(request):
     if not user:
         return json_err("unauthorized", 401)
     if request.method == "POST":
+        if key_scope(request) == "read":
+            return readonly_blocked(request)
         body = await request.json()
         name = clean_name(body.get("name"))
         if not name:
@@ -1153,6 +1341,8 @@ async def folder_delete(request):
     user = current_user(request)
     if not user:
         return json_err("unauthorized", 401)
+    if key_scope(request) == "read":
+        return readonly_blocked(request)
     fid = int(request.path_params["fid"])
     row = db.execute("SELECT * FROM folders WHERE id=? AND user_id=?", (fid, user["id"])).fetchone()
     if not row:
@@ -1232,6 +1422,8 @@ app = Starlette(
         Route("/api/folders/{fid}", folder_delete, methods=["DELETE"]),
         Route("/api/share/{token}", share_info),
         Route("/api/share/{token}/download", share_download),
+        Route("/api/keys", keys_endpoint, methods=["GET", "POST"]),
+        Route("/api/keys/{kid}", key_detail, methods=["PATCH", "DELETE"]),
         Mount("/static", StaticFiles(directory=BASE / "public")),
     ],
     lifespan=lifespan,

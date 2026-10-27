@@ -507,6 +507,96 @@ function resumeCooldown() {
   } catch {}
 }
 
+/* ---------- api keys ---------- */
+function keyWhen(t) {
+  if (!t) return "belum pernah dipakai";
+  const d = new Date(t * 1000);
+  return d.toLocaleDateString("id-ID", { day: "2-digit", month: "short", year: "2-digit" }) +
+    " " + d.toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit" });
+}
+
+function keyRow(k) {
+  const scope = k.scope === "read" ? '<span class="badge static">read</span>' : '<span class="badge static full">full</span>';
+  return `<div class="keyrow" data-key="${k.id}">
+      <div class="keymain">
+        <div class="keyname">${esc(k.name)} ${scope}</div>
+        <div class="keysub">${esc(k.prefix)}••••••••••  ·  ${k.uses}x  ·  ${keyWhen(k.last_used)}</div>
+      </div>
+      <div class="keyacts">
+        <button class="ghost" data-krename="${k.id}" title="ganti nama">nama</button>
+        <button class="ghost" data-kscope="${k.id}" title="ubah scope">scope</button>
+        <button class="ghost danger" data-kdel="${k.id}" title="cabut">cabut</button>
+      </div>
+    </div>`;
+}
+
+async function keysModal() {
+  let d;
+  try { d = await api("/api/keys"); } catch (e) { return toast(e.message, 1); }
+  const list = d.keys.length ? d.keys.map(keyRow).join("") : '<p class="muted" style="margin:6px 0 0">belum ada api key.</p>';
+  modal(`<h3>api key</h3>
+    <p class="muted" style="margin:0 0 14px;font-size:12.5px">pakai di bot telegram, ai, atau script. kirim lewat header <code>Authorization: Bearer nbla…</code> atau <code>X-API-Key</code>.</p>
+    <div class="keylist">${list}</div>
+    <div class="keynew">
+      <input id="keyName" placeholder="nama key (mis. bot-telegram)" maxlength="60">
+      <select id="keyScope">
+        <option value="full">full — baca + tulis</option>
+        <option value="read">read — baca saja</option>
+      </select>
+      <button class="btn primary" id="keyCreate">buat key</button>
+    </div>
+    <div class="foot"><span class="muted" style="margin-right:auto;font-size:11.5px">${d.keys.length}/${d.max} key</span>
+    <button class="btn" onclick="closeModal()">tutup</button></div>`);
+
+  $("#keyCreate").onclick = async () => {
+    const name = $("#keyName").value.trim();
+    const scope = $("#keyScope").value;
+    try {
+      const r = await api("/api/keys", { method: "POST", body: JSON.stringify({ name, scope }) });
+      showNewKey(r.key);
+    } catch (e) { toast(e.message, 1); }
+  };
+
+  document.querySelectorAll("[data-kdel]").forEach((b) => {
+    b.onclick = async () => {
+      try { await api("/api/keys/" + b.dataset.kdel, { method: "DELETE" }); toast("key dicabut"); keysModal(); }
+      catch (e) { toast(e.message, 1); }
+    };
+  });
+  document.querySelectorAll("[data-krename]").forEach((b) => {
+    b.onclick = () => {
+      const cur = (d.keys.find((x) => x.id === b.dataset.krename) || {}).name || "";
+      ask("ganti nama key", cur, async (v) => {
+        try { await api("/api/keys/" + b.dataset.krename, { method: "PATCH", body: JSON.stringify({ name: v }) }); keysModal(); }
+        catch (e) { toast(e.message, 1); }
+      });
+    };
+  });
+  document.querySelectorAll("[data-kscope]").forEach((b) => {
+    b.onclick = async () => {
+      const cur = (d.keys.find((x) => x.id === b.dataset.kscope) || {}).scope;
+      const next = cur === "read" ? "full" : "read";
+      try { await api("/api/keys/" + b.dataset.kscope, { method: "PATCH", body: JSON.stringify({ scope: next }) }); keysModal(); toast("scope jadi " + next); }
+      catch (e) { toast(e.message, 1); }
+    };
+  });
+}
+
+function showNewKey(raw) {
+  modal(`<h3>api key dibuat</h3>
+    <p class="muted" style="margin:0 0 12px;font-size:12.5px">salin sekarang — key ini tidak ditampilkan lagi.</p>
+    <div class="row"><input id="newKeyVal" readonly value="${esc(raw)}"></div>
+    <div class="foot"><button class="btn primary" id="copyKey">salin</button>
+    <button class="btn" id="doneKey">selesai</button></div>`);
+  const inp = $("#newKeyVal");
+  inp.focus(); inp.select();
+  $("#copyKey").onclick = async () => {
+    try { await navigator.clipboard.writeText(raw); } catch { inp.select(); document.execCommand("copy"); }
+    toast("key disalin");
+  };
+  $("#doneKey").onclick = () => keysModal();
+}
+
 /* ---------- auth ---------- */
 async function boot() {
   if (location.pathname.startsWith("/s/")) return bootShare();
@@ -575,6 +665,7 @@ $("#swapMode").onclick = () => {
 };
 
 $("#logout").onclick = async () => { await api("/api/logout", { method: "POST" }); location.reload(); };
+$("#keysBtn").onclick = keysModal;
 $("#verifyCheck").onchange = (e) => { if (e.target.checked) solveChallenge(); else resetVerify(); };
 $("#pick").onchange = (e) => uploadFiles(e.target.files);
 $("#newFolder").onclick = () => ask("folder baru", "", async (v) => {
