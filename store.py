@@ -11,6 +11,12 @@ CreateForumTopicRequest = importlib.import_module(
     _pkg + ".tl.functions.messages"
 ).CreateForumTopicRequest
 
+_upload = importlib.import_module(_pkg + ".tl.functions.upload")
+SaveBigFilePartRequest = _upload.SaveBigFilePartRequest
+SaveFilePartRequest = _upload.SaveFilePartRequest
+
 _types = importlib.import_module(_pkg + ".tl.types")
+InputFile = _types.InputFile
+InputFileBig = _types.InputFileBig
 DocumentAttributeFilename = _types.DocumentAttributeFilename
 MessageActionTopicCreate = _types.MessageActionTopicCreate

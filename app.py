@@ -29,6 +29,8 @@ from starlette.staticfiles import StaticFiles
 
 from store import (
     Client,
+    InputFileBig,
+    SaveBigFilePartRequest,
     CreateForumTopicRequest,
     DocumentAttributeFilename,
     MessageActionTopicCreate,
@@ -436,8 +438,49 @@ class Tg:
         )
         if topic:
             kwargs["reply_to"] = topic
-        msg = await self.client.send_file(self.vault, str(path), **kwargs)
+        size = os.path.getsize(path)
+        msg = None
+        if size >= 10 * 1024 * 1024:
+            try:
+                msg = await self.pipelined_upload(path, name, size, kwargs)
+            except Exception:  # noqa: BLE001
+                msg = None
+        if msg is None:
+            msg = await self.client.send_file(self.vault, str(path), **kwargs)
         return msg.id
+
+    async def pipelined_upload(self, path, name, size, kwargs, workers=8):
+        part = 512 * 1024
+        parts = (size + part - 1) // part
+        file_id = secrets.randbits(62) + 1
+        sem = asyncio.Semaphore(workers)
+        fh = open(path, "rb")
+
+        async def one(i):
+            async with sem:
+                for attempt in range(4):
+                    try:
+                        fh.seek(i * part)
+                        data = fh.read(part)
+                        if not data:
+                            raise RuntimeError("short read")
+                        await self.client(
+                            SaveBigFilePartRequest(
+                                file_id=file_id, file_part=i, file_total_parts=parts, bytes=data
+                            )
+                        )
+                        return
+                    except Exception:
+                        if attempt == 3:
+                            raise
+                        await asyncio.sleep(0.6 * (attempt + 1))
+
+        try:
+            await asyncio.gather(*(one(i) for i in range(parts)))
+        finally:
+            fh.close()
+        handle = InputFileBig(id=file_id, parts=parts, name=name)
+        return await self.client.send_file(self.vault, handle, **kwargs)
 
     async def media(self, msg_id):
         msg = await self.client.get_messages(self.vault, ids=int(msg_id))
