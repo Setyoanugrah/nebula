@@ -285,16 +285,22 @@ async function delFolder(id) {
 /* ---------- upload ---------- */
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-async function sendChunk(id, offset, blob) {
-  const r = await fetch("/api/upload/chunk?id=" + encodeURIComponent(id) + "&offset=" + offset, {
-    method: "POST",
-    headers: { "content-type": "application/octet-stream" },
-    body: blob,
-    credentials: "same-origin",
+function sendChunk(id, offset, blob, onProgress) {
+  return new Promise((resolve) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/upload/chunk?id=" + encodeURIComponent(id) + "&offset=" + offset);
+    xhr.setRequestHeader("content-type", "application/octet-stream");
+    xhr.upload.onprogress = (e) => { if (e.lengthComputable && onProgress) onProgress(e.loaded); };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) return resolve({ ok: true });
+      let d = {};
+      try { d = JSON.parse(xhr.responseText); } catch {}
+      resolve({ ok: false, status: xhr.status, error: d.error || "upload gagal" });
+    };
+    xhr.onerror = () => resolve({ ok: false, error: "koneksi putus" });
+    xhr.onabort = () => resolve({ ok: false, error: "dibatalkan" });
+    xhr.send(blob);
   });
-  if (r.ok) return { ok: true };
-  const d = await r.json().catch(() => ({}));
-  return { ok: false, status: r.status, error: d.error || "upload gagal" };
 }
 
 async function uploadFiles(list) {
@@ -314,17 +320,25 @@ async function uploadFiles(list) {
         method: "POST",
         body: JSON.stringify({ name: f.name, size: f.size, folder: state.folder, mime: f.type || "" }),
       });
-      const CH = init.chunk_size || 24 * 1024 * 1024;
+      const CH = init.chunk_size || 8 * 1024 * 1024;
       let off = 0;
       while (off < f.size) {
         const part = f.slice(off, Math.min(off + CH, f.size));
+        const show = (loaded) => {
+          const p = Math.min(100, Math.round(((sent + loaded) / total) * 100));
+          fill.style.width = p + "%"; pct.textContent = p + "%";
+        };
         let res = null;
         for (let t = 0; t < 4; t++) {
-          try { res = await sendChunk(init.id, off, part); }
+          try { res = await sendChunk(init.id, off, part, show); }
           catch { res = { ok: false, error: "koneksi putus" }; }
           if (res.ok) break;
           if (res.status === 409) {
-            try { off = (await api("/api/upload/status?id=" + encodeURIComponent(init.id))).received; } catch {}
+            try {
+              const st = await api("/api/upload/status?id=" + encodeURIComponent(init.id));
+              sent += Math.max(0, st.received - off);
+              off = st.received;
+            } catch {}
             res = { ok: true, resync: true };
             break;
           }
@@ -333,8 +347,7 @@ async function uploadFiles(list) {
         }
         if (!res || !res.ok) throw new Error((res && res.error) || "koneksi putus");
         if (!res.resync) { off += part.size; sent += part.size; }
-        const p = Math.min(100, Math.round((sent / total) * 100));
-        fill.style.width = p + "%"; pct.textContent = p + "%";
+        show(0);
       }
       note.textContent = "menyimpan…";
       last = await api("/api/upload/finish", { method: "POST", body: JSON.stringify({ id: init.id }) });
