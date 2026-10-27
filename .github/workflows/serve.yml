@@ -56,7 +56,7 @@ jobs:
         env:
           EDGE_TOKEN: ${{ secrets.NEBULA_EDGE_TOKEN }}
           NEBULA_TMP: /tmp/nebula
-          NEBULA_BACKUP_EVERY: "600"
+          NEBULA_BACKUP_EVERY: "300"
         run: |
           cloudflared tunnel --no-autoupdate run --token "$EDGE_TOKEN" > /tmp/cf.log 2>&1 &
           timeout 20700 python3 -u app.py

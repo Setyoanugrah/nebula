@@ -49,7 +49,7 @@ INVITE = os.environ.get("NEBULA_INVITE", "")
 CHALLENGES = {}
 HITS = defaultdict(deque)
 COOKIE = "nd"
-BACKUP_EVERY = int(os.environ.get("NEBULA_BACKUP_EVERY", "600"))
+BACKUP_EVERY = int(os.environ.get("NEBULA_BACKUP_EVERY", "300"))
 BACKUP_NAME = "nebula.db"
 
 SCHEMA = """
@@ -245,23 +245,33 @@ class Tg:
         try:
             msgs = await self.client.get_messages(self.vault, limit=100)
         except Exception as exc:  # noqa: BLE001
-            print("[db] restore scan failed:", repr(exc)[:120], flush=True)
+            print("[db] restore scan failed:", type(exc).__name__, flush=True)
             return False
-        best = None
-        for m in msgs:
-            f = getattr(m, "file", None)
-            if f and getattr(f, "name", None) == BACKUP_NAME:
-                best = m
-                break
-        if not best:
-            return False
-        tmp = TMP / "restore.db"
-        await self.client.download_media(best, file=str(tmp))
-        for suffix in ("-wal", "-shm"):
-            Path(str(DB_PATH) + suffix).unlink(missing_ok=True)
-        os.replace(tmp, DB_PATH)
-        print("[db] restored from msg", best.id, flush=True)
-        return True
+        cands = [
+            m
+            for m in msgs
+            if getattr(getattr(m, "file", None), "name", None) == BACKUP_NAME
+        ]
+        for m in cands:
+            tmp = TMP / ("restore_%s.db" % m.id)
+            try:
+                await self.client.download_media(m, file=str(tmp))
+                con = sqlite3.connect(str(tmp))
+                try:
+                    ok = con.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+                finally:
+                    con.close()
+                if not ok:
+                    raise RuntimeError("integrity")
+                for suffix in ("-wal", "-shm"):
+                    Path(str(DB_PATH) + suffix).unlink(missing_ok=True)
+                os.replace(tmp, DB_PATH)
+                print("[db] restored from msg", m.id, flush=True)
+                return True
+            except Exception as exc:  # noqa: BLE001
+                print("[db] restore skip", m.id, type(exc).__name__, flush=True)
+                tmp.unlink(missing_ok=True)
+        return False
 
     async def backup_db(self):
         if not self.vault:
@@ -459,6 +469,13 @@ async def challenge_endpoint(request):
     return JSONResponse({"seed": seed, "bits": bits, "invite": bool(INVITE)})
 
 
+async def safe_backup():
+    try:
+        await tg.backup_db()
+    except Exception as exc:  # noqa: BLE001
+        print("[db] backup failed:", type(exc).__name__, flush=True)
+
+
 async def register(request):
     body = await request.json()
     if (body.get("nickname") or "").strip():
@@ -488,6 +505,7 @@ async def register(request):
     user = dict(db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone())
     if tg.ready:
         await tg.ensure_topic(user)
+        asyncio.create_task(safe_backup())
     return await login_user(request, uid)
 
 
