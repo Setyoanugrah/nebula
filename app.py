@@ -136,6 +136,12 @@ def user_used(uid):
     return db.execute("SELECT COALESCE(SUM(size),0) AS s FROM files WHERE user_id=?", (uid,)).fetchone()["s"]
 
 
+def clean_folder(name):
+    name = (name or "").replace("\\", "_").replace("/", "_")
+    name = re.sub(r"[\x00-\x1f]", "", name).strip()
+    return name[:180]
+
+
 def clean_name(name):
     name = (name or "file").replace("\\", "_").replace("/", "_")
     name = re.sub(r"[\x00-\x1f]", "", name).strip()
@@ -236,6 +242,7 @@ class Tg:
             if await self.restore_db():
                 reopen_db()
             await self.rebuild_index()
+            repair_folders()
             self.ready = True
             print("[store] ready vault=", self.vault.id, flush=True)
         except Exception as exc:  # noqa: BLE001
@@ -504,6 +511,16 @@ async def challenge_endpoint(request):
     return JSONResponse({"seed": seed, "bits": bits, "invite": bool(INVITE)})
 
 
+def repair_folders():
+    cur = db.execute(
+        "UPDATE files SET folder='' WHERE folder<>'' AND NOT EXISTS "
+        "(SELECT 1 FROM folders f WHERE f.user_id=files.user_id AND f.name=files.folder)"
+    )
+    if cur.rowcount:
+        db.commit()
+        print("[db] folder repair", cur.rowcount, flush=True)
+
+
 async def safe_backup():
     try:
         await tg.backup_db()
@@ -688,7 +705,7 @@ async def upload_init(request):
         "user": user["id"],
         "name": name,
         "size": size,
-        "folder": clean_name(body.get("folder") or ""),
+        "folder": clean_folder(body.get("folder") or ""),
         "mime": body.get("mime") or mimetypes.guess_type(name)[0] or "application/octet-stream",
         "received": 0,
         "created": time.time(),
@@ -785,7 +802,7 @@ async def upload(request):
     if not tg.ready:
         return json_err(f"storage belum siap: {tg.error}", 503)
     form = await request.form()
-    folder = clean_name(form.get("folder") or "") if form.get("folder") else ""
+    folder = clean_folder(form.get("folder") or "")
     uploads = [f for f in form.getlist("files") if getattr(f, "filename", None)]
     if not uploads:
         return json_err("tidak ada file")
