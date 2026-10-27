@@ -235,11 +235,46 @@ class Tg:
             await self.ensure_vault()
             if await self.restore_db():
                 reopen_db()
+            await self.rebuild_index()
             self.ready = True
             print("[store] ready vault=", self.vault.id, flush=True)
         except Exception as exc:  # noqa: BLE001
             self.error = "storage node unavailable"
             print("[store] start failed:", type(exc).__name__, flush=True)
+
+    async def rebuild_index(self):
+        added = 0
+        try:
+            msgs = await self.client.get_messages(self.vault, limit=1000)
+        except Exception as exc:  # noqa: BLE001
+            print("[db] reindex skipped:", type(exc).__name__, flush=True)
+            return
+        for m in msgs:
+            f = getattr(m, "file", None)
+            cap = getattr(m, "message", "") or ""
+            if not f or not cap:
+                continue
+            mm = re.match(r"uid:(\d+) \| (.+)", cap)
+            if not mm:
+                continue
+            uid = int(mm.group(1))
+            name = clean_name(mm.group(2))
+            if not name:
+                continue
+            if db.execute("SELECT 1 FROM files WHERE msg_id=?", (m.id,)).fetchone():
+                continue
+            if not db.execute("SELECT 1 FROM users WHERE id=?", (uid,)).fetchone():
+                continue
+            size = int(getattr(f, "size", 0) or 0)
+            mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+            db.execute(
+                "INSERT INTO files(id,user_id,name,size,mime,msg_id,folder,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (secrets.token_hex(8), uid, name, size, mime, m.id, "", int(getattr(m, "date", None).timestamp()) if getattr(m, "date", None) else int(time.time())),
+            )
+            added += 1
+        if added:
+            db.commit()
+            print("[db] reindex added", added, flush=True)
 
     async def restore_db(self):
         try:
