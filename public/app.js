@@ -321,6 +321,12 @@ async function uploadFiles(list) {
         method: "POST",
         body: JSON.stringify({ name: f.name, size: f.size, folder: state.folder, mime: f.type || "" }),
       });
+      if (init.wait > 0) {
+        for (let left = init.wait; left > 0; left--) {
+          note.textContent = "jeda 1 menit antar upload · tunggu " + left + "s";
+          await sleep(1000);
+        }
+      }
       const CH = init.chunk_size || 8 * 1024 * 1024;
       let off = 0;
       while (off < f.size) {
@@ -356,6 +362,13 @@ async function uploadFiles(list) {
       }
       note.textContent = "menyimpan…";
       last = await api("/api/upload/finish", { method: "POST", body: JSON.stringify({ id: init.id }) });
+      while (last && last.retry) {
+        for (let left = last.wait; left > 0; left--) {
+          note.textContent = "menunggu antrean · " + left + "s";
+          await sleep(1000);
+        }
+        last = await api("/api/upload/finish", { method: "POST", body: JSON.stringify({ id: init.id }) });
+      }
       if (last.me) setMe(last.me);
     }
     bar.classList.add("hidden");

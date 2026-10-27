@@ -474,7 +474,10 @@ async def do_upload(user, path, name, mime):
         if wait > 0:
             await asyncio.sleep(wait)
         async with tg_slots:
-            msg_id = await tg.upload(user, path, name, mime)
+            try:
+                msg_id = await asyncio.wait_for(tg.upload(user, path, name, mime), timeout=300)
+            except asyncio.TimeoutError:
+                raise RuntimeError("storage timeout")
         user_next[uid] = time.time() + DELAY
     return msg_id
 
@@ -712,7 +715,8 @@ async def upload_init(request):
     }
     up_data_path(uid).write_bytes(b"")
     save_meta(meta)
-    return JSONResponse({"id": uid, "chunk_size": UPLOAD_CHUNK})
+    wait = user_next.get(user["id"], 0) - time.time()
+    return JSONResponse({"id": uid, "chunk_size": UPLOAD_CHUNK, "wait": int(wait) + 1 if wait > 0 else 0})
 
 
 async def upload_chunk(request):
@@ -764,6 +768,9 @@ async def upload_finish(request):
         return json_err("upload belum lengkap", 409)
     if user_used(user["id"]) + meta["size"] > QUOTA:
         return json_err("kuota penuh", 413)
+    wait = user_next.get(user["id"], 0) - time.time()
+    if wait > 2:
+        return JSONResponse({"retry": True, "wait": int(wait) + 1})
     path = up_data_path(uid)
     try:
         msg_id = await do_upload(user, str(path), meta["name"], meta["mime"])
