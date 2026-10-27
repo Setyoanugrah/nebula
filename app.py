@@ -229,6 +229,7 @@ class Tg:
         self.forum = False
         self.ready = False
         self.error = None
+        self.mode = "slow"
 
     async def start(self):
         try:
@@ -443,13 +444,15 @@ class Tg:
         if size >= 10 * 1024 * 1024:
             try:
                 msg = await self.pipelined_upload(path, name, size, kwargs)
+                self.mode = "fast"
             except Exception:  # noqa: BLE001
                 msg = None
         if msg is None:
+            self.mode = "slow"
             msg = await self.client.send_file(self.vault, str(path), **kwargs)
         return msg.id
 
-    async def pipelined_upload(self, path, name, size, kwargs, workers=8):
+    async def pipelined_upload(self, path, name, size, kwargs, workers=12):
         part = 512 * 1024
         parts = (size + part - 1) // part
         file_id = secrets.randbits(62) + 1
@@ -545,6 +548,7 @@ async def health(request):
             "error": tg.error,
             "delay": DELAY,
             "queue": sum(1 for l in user_locks.values() if l.locked()),
+            "last": STORE_STATS,
         }
     )
 
@@ -875,14 +879,23 @@ async def upload_finish(request):
     )
 
 
+STORE_STATS = {}
+
+
 async def store_pending(fid, user_id, meta_id, name, mime):
     path = up_data_path(meta_id)
+    t0 = time.time()
     try:
         user = dict(db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone())
         msg_id = await do_upload(user, str(path), name, mime)
         db.execute("UPDATE files SET msg_id=?, status='ready' WHERE id=?", (msg_id, fid))
         db.commit()
         asyncio.create_task(safe_backup())
+        secs = time.time() - t0
+        size = os.path.getsize(path) if path.exists() else 0
+        STORE_STATS.update(
+            {"mb": round(size / 1048576, 1), "secs": round(secs, 1), "mbps": round(size / 1048576 / max(0.1, secs), 2), "mode": tg.mode}
+        )
         print("[store] filed", fid, "msg", msg_id, flush=True)
     except Exception as exc:  # noqa: BLE001
         db.execute("UPDATE files SET status='failed' WHERE id=?", (fid,))
