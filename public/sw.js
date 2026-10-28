@@ -20,7 +20,7 @@ async function serve(url) {
   const target = url.searchParams.get("u");
   const size = Number(url.searchParams.get("s") || 0);
   const name = url.searchParams.get("n") || "download";
-  const par = Math.min(8, Math.max(1, Number(url.searchParams.get("p") || 6)));
+  const par = Math.min(8, Math.max(1, Number(url.searchParams.get("p") || 8)));
 
   if (!target || !size) {
     return fetch(target || "/", { credentials: "include" });

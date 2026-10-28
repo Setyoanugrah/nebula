@@ -323,7 +323,7 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 /* jumlah koneksi paralel — bottleneck-nya per-koneksi, bukan bandwidth server */
 const UP_PARALLEL = 6;
-const DL_PARALLEL = 6;
+const DL_PARALLEL = 8;
 const DL_MIN_SPLIT = 2 * 1024 * 1024;
 const DL_BLOCK = 8 * 1024 * 1024;
 const DL_MEM_MAX = 192 * 1024 * 1024;   // di atas ini jangan ditahan di RAM
