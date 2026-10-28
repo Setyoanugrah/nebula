@@ -22,8 +22,6 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-        with:
-          path: repo
 
       - uses: actions/setup-python@v5
         with:
@@ -45,7 +43,7 @@ jobs:
           STORE_KEY: ${{ secrets.NEBULA_STORE_KEY }}
           BENCH_MB: ${{ inputs.mb }}
           WORKERS: ${{ inputs.workers }}
-        run: python3 -u repo/_tgbench.py
+        run: python3 -u _tgbench.py
 
       - name: cleanup
         if: always()
