@@ -702,6 +702,18 @@ async def index(request):
     return resp
 
 
+async def service_worker(request):
+    body = (BASE / "public" / "sw.js").read_bytes()
+    return Response(
+        body,
+        media_type="application/javascript",
+        headers={
+            "cache-control": "no-cache",
+            "service-worker-allowed": "/",
+        },
+    )
+
+
 async def health(request):
     return JSONResponse(
         {
@@ -1400,6 +1412,7 @@ app = Starlette(
     routes=[
         Route("/", index),
         Route("/s/{token}", index),
+        Route("/sw.js", service_worker),
         Route("/api/health", health),
         Route("/api/challenge", challenge_endpoint),
         Route("/api/register", register, methods=["POST"]),

@@ -183,7 +183,7 @@ function render() {
       <div class="actions">
         ${
           ready
-            ? `<a class="act" href="/api/file/${f.id}/download" title="unduh">${I.download}</a>
+            ? `<button class="act" data-dl="${f.id}" title="unduh">${I.download}</button>
         <button class="act" data-share="${f.id}" title="bagikan">${I.share}</button>
         <button class="act" data-rename="${f.id}" title="ganti nama">${I.edit}</button>`
             : ""
@@ -198,6 +198,12 @@ function render() {
   );
   grid.querySelectorAll("[data-open]").forEach((n) =>
     n.addEventListener("click", () => { state.folder = decodeURIComponent(n.dataset.open); state.q = ""; $("#q").value = ""; closeSide(); loadFiles(); })
+  );
+  grid.querySelectorAll("[data-dl]").forEach((n) =>
+    n.addEventListener("click", () => {
+      const f = state.files.find((x) => x.id === n.dataset.dl);
+      if (f) parallelDownload(f);
+    })
   );
   grid.querySelectorAll("[data-share]").forEach((n) =>
     n.addEventListener("click", () => shareFile(n.dataset.share))
@@ -261,7 +267,9 @@ async function preview(id) {
   } else body = `<p class="muted">tidak ada pratinjau. <a href="/api/file/${id}/download">unduh</a></p>`;
   modal(`<h3>${esc(f.name)}</h3><div class="preview">${body}</div>
     <div class="foot"><span class="muted" style="margin-right:auto">${size(f.size)}</span>
-    <a class="btn" href="/api/file/${id}/download">unduh</a><button class="btn" onclick="closeModal()">tutup</button></div>`);
+    <button class="btn" id="dlModal">unduh</button><button class="btn" onclick="closeModal()">tutup</button></div>`);
+  const dlb = $("#dlModal");
+  if (dlb) dlb.onclick = () => { closeModal(); parallelDownload(f); };
 }
 
 async function shareFile(id) {
@@ -312,6 +320,174 @@ async function delFolder(id) {
 
 /* ---------- upload ---------- */
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+/* jumlah koneksi paralel — bottleneck-nya per-koneksi, bukan bandwidth server */
+const UP_PARALLEL = 6;
+const DL_PARALLEL = 6;
+const DL_MIN_SPLIT = 2 * 1024 * 1024;
+const DL_BLOCK = 8 * 1024 * 1024;
+const DL_MEM_MAX = 192 * 1024 * 1024;   // di atas ini jangan ditahan di RAM
+
+/* ---------- download paralel ---------- */
+const dlJobs = new Map();
+
+function dlFallback(url, name) {
+  const a = document.createElement("a");
+  a.href = url; a.download = name || "";
+  document.body.appendChild(a); a.click(); a.remove();
+}
+
+/* Service worker: jalur paralel yang tetap hemat memori (stream ke disk). */
+let swReady = null;
+function ensureSw() {
+  if (!("serviceWorker" in navigator)) return Promise.resolve(false);
+  if (swReady) return swReady;
+  swReady = navigator.serviceWorker
+    .register("/sw.js", { scope: "/" })
+    .then(() => navigator.serviceWorker.ready)
+    .then(() => true)
+    .catch(() => false);
+  return swReady;
+}
+
+function swDownload(url, name, size, par) {
+  const q = new URLSearchParams({ u: url, s: String(size), n: name || "download", p: String(par) });
+  return dlFallback("/sw-dl?" + q, name);
+}
+
+async function fastDownload(url, name, total, mime, key) {
+  if (dlJobs.has(key)) return toast("file ini sedang diunduh");
+
+  // file kecil atau tanpa info ukuran: biar browser yang urus
+  if (!total || total < DL_MIN_SPLIT) return dlFallback(url, name);
+
+  const canStream = typeof window.showSaveFilePicker === "function";
+
+  // Jalur utama: service worker menjahit range paralel jadi satu stream ke disk.
+  // Memory konstan, jadi aman untuk file besar, dan jalan di semua browser modern.
+  const swOk = await ensureSw();
+  if (swOk && navigator.serviceWorker.controller) {
+    const par = Math.max(2, Math.min(DL_PARALLEL, Math.ceil(total / DL_MIN_SPLIT)));
+    toast("mengunduh " + name + " · " + par + " koneksi");
+    return swDownload(url, name, total, par);
+  }
+
+  // Tanpa SW dan file kegedean buat RAM: jangan dipaksa, serahkan ke browser
+  if (!canStream && total > DL_MEM_MAX) return dlFallback(url, name);
+
+  const ctrl = { cancelled: false, parallel: 0 };
+  dlJobs.set(key, ctrl);
+
+  const bar = $("#progress"), fill = $("#pFill"), pct = $("#pPct"), nm = $("#pName"), note = $("#pNote");
+  bar.classList.remove("hidden");
+  nm.textContent = "mengunduh " + name;
+  fill.style.width = "0%"; pct.textContent = "0%";
+  note.textContent = "0 / " + size(total);
+
+  let handle = null;
+  if (canStream) {
+    try {
+      handle = await window.showSaveFilePicker({ suggestedName: name });
+    } catch (e) {
+      bar.classList.add("hidden"); dlJobs.delete(key);
+      return; // user batal
+    }
+  }
+
+  const started = Date.now();
+  let got = 0;
+  const show = () => {
+    const p = total ? Math.min(100, Math.round((got / total) * 100)) : 0;
+    fill.style.width = p + "%"; pct.textContent = p + "%";
+    const secs = Math.max(1, (Date.now() - started) / 1000);
+    const mbps = got / 1048576 / secs;
+    note.textContent = size(got) + " / " + size(total) + " · " +
+      (mbps >= 1 ? mbps.toFixed(1) : mbps.toFixed(2)) + " MB/s" +
+      (ctrl.parallel > 1 ? " · " + ctrl.parallel + " koneksi" : "");
+  };
+
+  const blockCount = Math.max(2, Math.min(DL_PARALLEL, Math.ceil(total / DL_MIN_SPLIT)));
+  const blockSize = Math.ceil(total / blockCount);
+  const bufs = new Array(blockCount);
+  let failed = null;
+  let writable = null;
+  if (handle) writable = await handle.createWritable();
+
+  const fetchBlock = async (i) => {
+    const a = i * blockSize;
+    const b = Math.min(a + blockSize, total) - 1;
+    let pos = a;
+    const parts = [];
+    while (pos <= b) {
+      if (ctrl.cancelled || failed) return;
+      const end = Math.min(pos + DL_BLOCK - 1, b);
+      let res;
+      try {
+        res = await fetch(url, { headers: { Range: `bytes=${pos}-${end}` } });
+      } catch (e) { failed = e; return; }
+      if (res.status !== 206 && res.status !== 200) {
+        failed = new Error("unduh gagal: " + res.status);
+        return;
+      }
+      let buf;
+      try { buf = await res.arrayBuffer(); } catch (e) { failed = e; return; }
+      if (ctrl.cancelled) return;
+      // server tanpa Range: isi penuh balik sekaligus
+      if (res.status === 200 && buf.byteLength === total && blockCount > 1) {
+        if (writable) { await writable.write({ type: "write", position: 0, data: buf }); }
+        else bufs[i] = buf;
+        got = total; show();
+        return;
+      }
+      if (writable) {
+        await writable.write({ type: "write", position: pos, data: buf });
+      } else {
+        parts.push(new Uint8Array(buf));
+      }
+      pos += buf.byteLength;
+      got += buf.byteLength;
+      show();
+      if (buf.byteLength === 0) break;
+    }
+    if (writable) return;
+    const len = parts.reduce((n, p) => n + p.length, 0);
+    const out = new Uint8Array(len);
+    let off = 0;
+    for (const p of parts) { out.set(p, off); off += p.length; }
+    bufs[i] = out.buffer;
+  };
+
+  ctrl.parallel = blockCount;
+  try {
+    await Promise.all(Array.from({ length: blockCount }, (_, i) => fetchBlock(i)));
+    if (failed) throw failed;
+    if (ctrl.cancelled) throw new Error("dibatalkan");
+
+    if (writable) {
+      note.textContent = "menyelesaikan…";
+      await writable.close();
+      writable = null;
+    } else {
+      note.textContent = "menyusun file…";
+      const blob = new Blob(bufs.filter(Boolean), { type: mime || "application/octet-stream" });
+      const href = URL.createObjectURL(blob);
+      dlFallback(href, name);
+      setTimeout(() => URL.revokeObjectURL(href), 60000);
+    }
+    const secs = Math.max(1, (Date.now() - started) / 1000);
+    toast(name + " · " + (total / 1048576 / secs).toFixed(1) + " MB/s");
+  } catch (e) {
+    if (writable) { try { await writable.abort(); } catch {} }
+    if (!ctrl.cancelled) toast((e && e.message) || "unduh gagal", 1);
+  } finally {
+    bar.classList.add("hidden");
+    dlJobs.delete(key);
+  }
+}
+
+function parallelDownload(f) {
+  return fastDownload(`/api/file/${f.id}/download`, f.name, f.size, f.mime, f.id);
+}
 
 function sendChunk(id, offset, blob, onProgress) {
   return new Promise((resolve) => {
@@ -412,7 +588,8 @@ async function uploadFiles(list) {
             try { await sendOne(idx); } catch (e) { failed = e; }
           }
         };
-        await Promise.all([worker(), worker()]);
+        const lanes = Math.max(1, Math.min(UP_PARALLEL, indices.length));
+        await Promise.all(Array.from({ length: lanes }, () => worker()));
         if (failed) throw failed;
       };
       let indices = Array.from({ length: totalChunks }, (_, i) => i);
@@ -627,7 +804,9 @@ async function bootShare() {
       </div>
       <div style="margin:14px 0 4px;color:var(--txt);font-weight:600;word-break:break-word">${esc(d.name)}</div>
       <div class="muted" style="font-size:12.5px">${size(d.size)} · ${when(d.created_at)}</div>
-      <a class="btn primary" style="width:100%;margin-top:16px" href="/api/share/${token}/download">unduh</a>`;
+      <button class="btn primary" id="shareDl" style="width:100%;margin-top:16px">unduh</button>`;
+    const sb = $("#shareDl");
+    if (sb) sb.onclick = () => fastDownload(`/api/share/${token}/download`, d.name, d.size, d.mime, "share:" + token);
   } catch { $("#shareBody").textContent = "file tidak ditemukan atau link dicabut."; }
 }
 
