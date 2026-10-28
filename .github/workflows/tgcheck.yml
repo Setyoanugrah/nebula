@@ -6,6 +6,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -15,28 +16,4 @@ jobs:
           SESSION: ${{ secrets.NEBULA_STORE_SESSION }}
           API_ID: ${{ secrets.NEBULA_STORE_ID }}
           API_KEY: ${{ secrets.NEBULA_STORE_KEY }}
-        run: |
-          python3 - <<'PY'
-          import asyncio, os, traceback
-          from telethon import TelegramClient
-          from telethon.sessions import StringSession
-          async def main():
-              s = os.environ["SESSION"].strip()
-              print("session len", len(s), "prefix", s[:4])
-              c = TelegramClient(StringSession(s), int(os.environ["API_ID"]), os.environ["API_KEY"],
-                                 device_model="Nebula", system_version="1.0")
-              try:
-                  await c.connect()
-                  print("connected:", c.is_connected())
-                  print("authorized:", await c.is_user_authorized())
-                  if await c.is_user_authorized():
-                      me = await c.get_me()
-                      print("me:", me.id, me.username, me.first_name)
-                      print("dc:", c.session.dc_id)
-              except Exception as e:
-                  print("ERROR:", type(e).__name__, e)
-                  traceback.print_exc()
-              finally:
-                  await c.disconnect()
-          asyncio.run(main())
-          PY
+        run: python3 -u tgcheck.py
