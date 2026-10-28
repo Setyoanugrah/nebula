@@ -78,7 +78,9 @@ SCHEMA = """
         msg_id INTEGER NOT NULL,
         folder TEXT NOT NULL DEFAULT '',
         share_token TEXT UNIQUE,
-        created_at INTEGER NOT NULL
+        created_at INTEGER NOT NULL,
+        hash TEXT NOT NULL DEFAULT '',
+        trashed_at INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS folders(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -148,7 +150,44 @@ def check_pw(password, salt, expected):
 
 
 def user_used(uid):
-    return db.execute("SELECT COALESCE(SUM(size),0) AS s FROM files WHERE user_id=?", (uid,)).fetchone()["s"]
+    """Pemakaian kuota dihitung per-pesan storage, bukan per-file.
+
+    File hasil dedup berbagi satu pesan storage, jadi tidak boleh ditagih dua kali.
+    File yang masih pending (msg_id=0) tetap dihitung sendiri-sendiri.
+    """
+    shared = db.execute(
+        "SELECT COALESCE(SUM(size),0) AS s FROM ("
+        "  SELECT MAX(size) AS size FROM files"
+        "  WHERE user_id=? AND trashed_at=0 AND msg_id>0 GROUP BY msg_id"
+        ")",
+        (uid,),
+    ).fetchone()["s"]
+    pending = db.execute(
+        "SELECT COALESCE(SUM(size),0) AS s FROM files"
+        " WHERE user_id=? AND trashed_at=0 AND (msg_id IS NULL OR msg_id=0)",
+        (uid,),
+    ).fetchone()["s"]
+    return shared + pending
+
+
+def user_trashed(uid):
+    row = db.execute(
+        "SELECT COALESCE(SUM(size),0) AS s, COUNT(*) AS c FROM files WHERE user_id=? AND trashed_at>0",
+        (uid,),
+    ).fetchone()
+    return row["s"], row["c"]
+
+
+def file_hash(path, chunk=1024 * 1024):
+    """SHA-256 isi file, dipakai untuk dedup."""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while True:
+            b = fh.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
 
 
 def clean_folder(name):
@@ -815,12 +854,16 @@ async def login_user(request, uid):
 
 def me_payload(user):
     used = user_used(user["id"])
+    tsize, tcount = user_trashed(user["id"])
     return {
         "id": user["id"],
         "username": user["username"],
         "used": used,
         "quota": QUOTA,
-        "count": db.execute("SELECT COUNT(*) c FROM files WHERE user_id=?", (user["id"],)).fetchone()["c"],
+        "count": db.execute(
+            "SELECT COUNT(*) c FROM files WHERE user_id=? AND trashed_at=0", (user["id"],)
+        ).fetchone()["c"],
+        "trash": {"size": tsize, "count": tcount},
     }
 
 
@@ -856,8 +899,17 @@ async def list_files(request):
         return json_err("unauthorized", 401)
     folder = request.query_params.get("folder", "")
     q = (request.query_params.get("q") or "").strip()
-    sql = "SELECT id,name,size,mime,folder,share_token,created_at,status,msg_id FROM files WHERE user_id=? AND folder=?"
-    args = [user["id"], folder]
+    view = request.query_params.get("view") or ""
+    sql = (
+        "SELECT id,name,size,mime,folder,share_token,created_at,status,msg_id,trashed_at "
+        "FROM files WHERE user_id=?"
+    )
+    args = [user["id"]]
+    if view == "trash":
+        sql += " AND trashed_at>0"
+    else:
+        sql += " AND trashed_at=0 AND folder=?"
+        args.append(folder)
     if q:
         sql += " AND name LIKE ?"
         args.append(f"%{q}%")
@@ -1038,13 +1090,56 @@ async def upload_finish(request):
                     "delay": DELAY,
                 }
             )
+
+    # dedup: kalau byte-nya sudah ada di akun ini, jangan kirim ulang ke storage
+    digest = ""
+    try:
+        digest = file_hash(up_data_path(uid))
+    except Exception:  # noqa: BLE001
+        digest = ""
+    if digest:
+        dup = db.execute(
+            "SELECT * FROM files WHERE user_id=? AND hash=? AND status='ready' AND trashed_at=0 LIMIT 1",
+            (user["id"], digest),
+        ).fetchone()
+        if dup and dup["msg_id"]:
+            wait = user_next.get(user["id"], 0) - time.time()
+            if wait > 2:
+                return JSONResponse({"retry": True, "wait": int(wait) + 1})
+            fid = secrets.token_hex(8)
+            db.execute(
+                "INSERT INTO files(id,user_id,name,size,mime,msg_id,folder,created_at,status,hash)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (fid, user["id"], meta["name"], meta["size"], meta["mime"], dup["msg_id"],
+                 meta["folder"], int(time.time()), "ready", digest),
+            )
+            db.commit()
+            up_data_path(uid).unlink(missing_ok=True)
+            up_meta_path(uid).unlink(missing_ok=True)
+            asyncio.create_task(safe_backup())
+            return JSONResponse(
+                {
+                    "file": {
+                        "id": fid,
+                        "name": meta["name"],
+                        "size": meta["size"],
+                        "mime": meta["mime"],
+                        "folder": meta["folder"],
+                        "status": "ready",
+                        "dedup": True,
+                    },
+                    "me": me_payload(user),
+                    "delay": DELAY,
+                }
+            )
+
     wait = user_next.get(user["id"], 0) - time.time()
     if wait > 2:
         return JSONResponse({"retry": True, "wait": int(wait) + 1})
     fid = secrets.token_hex(8)
     db.execute(
-        "INSERT INTO files(id,user_id,name,size,mime,msg_id,folder,created_at,status) VALUES(?,?,?,?,?,?,?,?,?)",
-        (fid, user["id"], meta["name"], meta["size"], meta["mime"], 0, meta["folder"], int(time.time()), "pending"),
+        "INSERT INTO files(id,user_id,name,size,mime,msg_id,folder,created_at,status,hash) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (fid, user["id"], meta["name"], meta["size"], meta["mime"], 0, meta["folder"], int(time.time()), "pending", digest),
     )
     db.commit()
     meta["file_id"] = fid
@@ -1154,6 +1249,14 @@ def migrate():
     if "status" not in cols:
         db.execute("ALTER TABLE files ADD COLUMN status TEXT DEFAULT 'ready'")
         db.commit()
+    if "hash" not in cols:
+        db.execute("ALTER TABLE files ADD COLUMN hash TEXT NOT NULL DEFAULT ''")
+        db.commit()
+    if "trashed_at" not in cols:
+        db.execute("ALTER TABLE files ADD COLUMN trashed_at INTEGER NOT NULL DEFAULT 0")
+        db.commit()
+    db.execute("CREATE INDEX IF NOT EXISTS idx_files_hash ON files(user_id, hash)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_files_trash ON files(user_id, trashed_at)")
     db.execute("UPDATE files SET status='ready' WHERE status IS NULL")
     db.execute("UPDATE files SET status='failed' WHERE status='pending' AND (msg_id IS NULL OR msg_id=0)")
     db.commit()
@@ -1280,7 +1383,72 @@ async def rename(request):
     return JSONResponse({"ok": True, "name": name, "folder": folder})
 
 
+TRASH_DAYS = int(os.environ.get("NEBULA_TRASH_DAYS", "30"))
+
+
+def storage_refs(msg_id):
+    """Berapa file lain yang masih memakai pesan storage yang sama (efek dedup)."""
+    return db.execute(
+        "SELECT COUNT(*) c FROM files WHERE msg_id=?", (msg_id,)
+    ).fetchone()["c"]
+
+
+async def drop_storage(msg_id):
+    """Hapus pesan storage hanya kalau tidak ada file lain yang menunjuk ke sana.
+
+    Dipanggil SETELAH row-nya dihapus dari DB, jadi hitungan ini hanya menyisakan
+    file lain yang berbagi pesan storage yang sama.
+    """
+    if not msg_id:
+        return
+    if storage_refs(msg_id) > 0:
+        return
+    try:
+        if tg.ready and tg.vault:
+            await tg.client.delete_messages(tg.vault, [msg_id])
+    except Exception as exc:  # noqa: BLE001
+        print("[store] delete failed:", type(exc).__name__, flush=True)
+
+
 async def delete(request):
+    """Soft delete: file masuk tong sampah, storage tetap ada sampai di-purge."""
+    user = current_user(request)
+    if not user:
+        return json_err("unauthorized", 401)
+    if key_scope(request) == "read":
+        return readonly_blocked(request)
+    row = get_file(request.path_params["fid"], user["id"])
+    if not row:
+        return json_err("not found", 404)
+    db.execute(
+        "UPDATE files SET trashed_at=?, share_token=NULL WHERE id=?",
+        (int(time.time()), row["id"]),
+    )
+    db.commit()
+    return JSONResponse({"ok": True, "trashed": True, "me": me_payload(user)})
+
+
+async def restore(request):
+    user = current_user(request)
+    if not user:
+        return json_err("unauthorized", 401)
+    if key_scope(request) == "read":
+        return readonly_blocked(request)
+    row = get_file(request.path_params["fid"], user["id"])
+    if not row:
+        return json_err("not found", 404)
+    if not row["trashed_at"]:
+        return json_err("file tidak di tong sampah", 409)
+    used = user_used(user["id"])
+    if used + row["size"] > QUOTA:
+        return json_err("kuota penuh, kosongkan dulu", 413)
+    db.execute("UPDATE files SET trashed_at=0 WHERE id=?", (row["id"],))
+    db.commit()
+    return JSONResponse({"ok": True, "me": me_payload(user)})
+
+
+async def purge(request):
+    """Hapus permanen satu file dari tong sampah (atau paksa hapus file aktif)."""
     user = current_user(request)
     if not user:
         return json_err("unauthorized", 401)
@@ -1291,12 +1459,59 @@ async def delete(request):
         return json_err("not found", 404)
     db.execute("DELETE FROM files WHERE id=?", (row["id"],))
     db.commit()
-    try:
-        if tg.ready and tg.vault:
-            await tg.client.delete_messages(tg.vault, [row["msg_id"]])
-    except Exception as exc:  # noqa: BLE001
-        print("[store] delete failed:", type(exc).__name__, flush=True)
+    await drop_storage(row["msg_id"])
     return JSONResponse({"ok": True, "me": me_payload(user)})
+
+
+async def trash_endpoint(request):
+    """GET: isi tong sampah. DELETE: kosongkan semua."""
+    user = current_user(request)
+    if not user:
+        return json_err("unauthorized", 401)
+    if request.method == "DELETE":
+        if key_scope(request) == "read":
+            return readonly_blocked(request)
+        rows = db.execute(
+            "SELECT id,msg_id FROM files WHERE user_id=? AND trashed_at>0", (user["id"],)
+        ).fetchall()
+        db.execute("DELETE FROM files WHERE user_id=? AND trashed_at>0", (user["id"],))
+        db.commit()
+        for r in rows:
+            await drop_storage(r["msg_id"])
+        return JSONResponse({"ok": True, "removed": len(rows), "me": me_payload(user)})
+    rows = db.execute(
+        "SELECT id,name,size,mime,folder,created_at,trashed_at,status FROM files"
+        " WHERE user_id=? AND trashed_at>0 ORDER BY trashed_at DESC",
+        (user["id"],),
+    ).fetchall()
+    left = 0
+    if TRASH_DAYS > 0:
+        deadline = int(time.time()) - TRASH_DAYS * 86400
+        left = db.execute(
+            "SELECT COUNT(*) c FROM files WHERE user_id=? AND trashed_at>0 AND trashed_at<?",
+            (user["id"], deadline),
+        ).fetchone()["c"]
+    return JSONResponse(
+        {"files": [dict(r) for r in rows], "days": TRASH_DAYS, "expired": left}
+    )
+
+
+async def purge_expired():
+    """Buang file tong sampah yang lewat masa simpan."""
+    if TRASH_DAYS <= 0:
+        return 0
+    deadline = int(time.time()) - TRASH_DAYS * 86400
+    rows = db.execute(
+        "SELECT id,msg_id FROM files WHERE trashed_at>0 AND trashed_at<?", (deadline,)
+    ).fetchall()
+    if not rows:
+        return 0
+    db.execute("DELETE FROM files WHERE trashed_at>0 AND trashed_at<?", (deadline,))
+    db.commit()
+    for r in rows:
+        await drop_storage(r["msg_id"])
+    print("[trash] purged", len(rows), flush=True)
+    return len(rows)
 
 
 async def share(request):
@@ -1384,6 +1599,10 @@ async def lifespan(app):
             except Exception as exc:  # noqa: BLE001
                 print("[db] backup failed:", repr(exc)[:160], flush=True)
             gc_uploads(3600)
+            try:
+                await purge_expired()
+            except Exception as exc:  # noqa: BLE001
+                print("[trash] purge failed:", type(exc).__name__, flush=True)
 
     task = None
     if tg.ready:
@@ -1429,6 +1648,9 @@ app = Starlette(
         Route("/api/file/{fid}/view", view),
         Route("/api/file/{fid}", rename, methods=["PATCH"]),
         Route("/api/file/{fid}", delete, methods=["DELETE"]),
+        Route("/api/file/{fid}/purge", purge, methods=["DELETE"]),
+        Route("/api/file/{fid}/restore", restore, methods=["POST"]),
+        Route("/api/trash", trash_endpoint, methods=["GET", "DELETE"]),
         Route("/api/file/{fid}/share", share, methods=["POST"]),
         Route("/api/file/{fid}/share", unshare, methods=["DELETE"]),
         Route("/api/folders", folders, methods=["GET", "POST"]),

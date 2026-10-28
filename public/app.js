@@ -1,5 +1,5 @@
 const $ = (s) => document.querySelector(s);
-const state = { me: null, folder: "", q: "", files: [], folders: [], mode: "login", delay: 60 };
+const state = { me: null, folder: "", q: "", files: [], folders: [], mode: "login", delay: 60, view: "" };
 
 const I = {
   image: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="8.5" cy="9.5" r="1.6"/><path d="m4 17 5-5 4 4 3-3 4 4"/></svg>',
@@ -14,6 +14,7 @@ const I = {
   share: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="17" cy="6" r="2.6"/><circle cx="7" cy="12" r="2.6"/><circle cx="17" cy="18" r="2.6"/><path d="m9.3 10.7 5.4-3.2M9.3 13.3l5.4 3.2"/></svg>',
   trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13"/></svg>',
   edit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="m4 20 4-1 10-10-3-3L5 16z"/><path d="m14 6 3 3"/></svg>',
+  restore: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 12a8 8 0 1 0 3-6.2"/><path d="M4 4v5h5"/></svg>',
 };
 
 function iconFor(name, mime) {
@@ -131,6 +132,7 @@ function setMe(me) {
 
 async function loadFiles() {
   const qs = new URLSearchParams({ folder: state.folder, q: state.q });
+  if (state.view === "trash") qs.set("view", "trash");
   const d = await api("/api/files?" + qs);
   state.files = d.files;
   state.folders = d.folders;
@@ -142,11 +144,12 @@ function render() {
   const grid = $("#grid");
   grid.innerHTML = "";
   const files = state.files;
-  const folders = state.folders.filter((f) => f.name !== state.folder);
-  $("#crumb").textContent = state.folder || "Semua file";
+  const trashed = state.view === "trash";
+  const folders = trashed ? [] : state.folders.filter((f) => f.name !== state.folder);
+  $("#crumb").textContent = trashed ? "tong sampah" : state.folder || "Semua file";
   $("#count").textContent = files.length ? files.length + " file" : "";
 
-  if (!state.q) {
+  if (!state.q && !trashed) {
     folders.forEach((f) => {
       const el = document.createElement("div");
       el.className = "card";
@@ -182,13 +185,16 @@ function render() {
       </div>
       <div class="actions">
         ${
-          ready
+          trashed
+            ? `<button class="act" data-restore="${f.id}" title="pulihkan">${I.restore}</button>
+        <button class="act del" data-purge="${f.id}" title="hapus permanen">${I.trash}</button>`
+            : ready
             ? `<button class="act" data-dl="${f.id}" title="unduh">${I.download}</button>
         <button class="act" data-share="${f.id}" title="bagikan">${I.share}</button>
-        <button class="act" data-rename="${f.id}" title="ganti nama">${I.edit}</button>`
-            : ""
+        <button class="act" data-rename="${f.id}" title="ganti nama">${I.edit}</button>
+        <button class="act del" data-del="${f.id}" title="pindah ke tong sampah">${I.trash}</button>`
+            : `<button class="act del" data-del="${f.id}" title="pindah ke tong sampah">${I.trash}</button>`
         }
-        <button class="act del" data-del="${f.id}" title="hapus">${I.trash}</button>
       </div>`;
     grid.append(el);
   });
@@ -213,6 +219,19 @@ function render() {
   );
   grid.querySelectorAll("[data-del]").forEach((n) =>
     n.addEventListener("click", () => delFile(n.dataset.del))
+  );
+  grid.querySelectorAll("[data-restore]").forEach((n) =>
+    n.addEventListener("click", async () => {
+      try { await api(`/api/file/${n.dataset.restore}/restore`, { method: "POST" }); toast("file dipulihkan"); loadFiles(); refreshTrash(); }
+      catch (e) { toast(e.message, 1); }
+    })
+  );
+  grid.querySelectorAll("[data-purge]").forEach((n) =>
+    n.addEventListener("click", async () => {
+      if (!confirm("Hapus permanen? Tidak bisa dibatalkan.")) return;
+      try { await api(`/api/file/${n.dataset.purge}/purge`, { method: "DELETE" }); toast("dihapus permanen"); loadFiles(); refreshTrash(); }
+      catch (e) { toast(e.message, 1); }
+    })
   );
   grid.querySelectorAll("[data-delfolder]").forEach((n) =>
     n.addEventListener("click", () => delFolder(n.dataset.delfolder))
@@ -307,9 +326,32 @@ function renameFile(id) {
 }
 
 async function delFile(id) {
-  if (!confirm("hapus file ini? file juga dihapus permanen.")) return;
-  try { const d = await api(`/api/file/${id}`, { method: "DELETE" }); setMe(d.me); loadFiles(); toast("file dihapus"); }
+  if (!confirm("pindahkan file ke tong sampah?")) return;
+  try { const d = await api(`/api/file/${id}`, { method: "DELETE" }); setMe(d.me); loadFiles(); refreshTrash(); toast("dipindah ke tong sampah"); }
   catch (e) { toast(e.message, 1); }
+}
+
+async function refreshTrash() {
+  try {
+    const d = await api("/api/trash");
+    const n = (d.files || []).length;
+    const b = $("#trashCount");
+    if (!b) return;
+    b.textContent = n;
+    b.classList.toggle("hidden", n === 0);
+  } catch {}
+}
+
+function setView(v) {
+  state.view = v;
+  state.folder = "";
+  state.q = "";
+  $("#q").value = "";
+  document.querySelectorAll(".nav").forEach((n) => n.classList.remove("active"));
+  if (v === "trash") $("#trashNav").classList.add("active");
+  else document.querySelector('.nav[data-folder=""]').classList.add("active");
+  closeSide();
+  loadFiles();
 }
 
 async function delFolder(id) {
@@ -784,6 +826,7 @@ async function boot() {
     $("#app").classList.remove("hidden");
     await loadFiles();
     resumeCooldown();
+    refreshTrash();
   } catch {
     $("#auth").classList.remove("hidden");
     resetVerify();
@@ -851,6 +894,7 @@ $("#newFolder").onclick = () => ask("folder baru", "", async (v) => {
   try { await api("/api/folders", { method: "POST", body: JSON.stringify({ name: v }) }); loadFiles(); toast("folder dibuat"); }
   catch (e) { toast(e.message, 1); }
 });
+$("#trashNav").onclick = () => setView(state.view === "trash" ? "" : "trash");
 $("#menu").onclick = () => $(".side").classList.toggle("open");
 
 let searchT;

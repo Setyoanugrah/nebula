@@ -41,6 +41,28 @@ Actions runner behind an edge tunnel. Set these repository secrets:
 
 Then run the `nebula` workflow. The app is live as soon as `/api/health` responds.
 
+## Trash and dedup
+
+Deleting a file no longer destroys it. It moves to **tong sampah** (sidebar), where it stops
+counting toward your quota, stops being listed, and its share link dies. Restore puts it back;
+purge removes it for good. Anything left in the trash is purged automatically after
+`NEBULA_TRASH_DAYS` (default 30).
+
+Uploads are deduplicated by content. The server hashes the finished upload and, if the same
+bytes already exist on the account, the new file points at the existing storage message instead
+of sending it again. The upload response carries `"dedup": true` when that happened. Quota is
+charged per storage message, so a duplicate costs nothing, and the underlying message is only
+deleted once the last file referencing it is gone.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/trash` | list trashed files, retention days, expired count |
+| `DELETE` | `/api/trash` | empty the trash |
+| `POST` | `/api/file/{id}/restore` | restore one file |
+| `DELETE` | `/api/file/{id}/purge` | delete one file permanently |
+
+`DELETE /api/file/{id}` is now a soft delete. `GET /api/files?view=trash` lists the trash too.
+
 ## API keys
 
 Every account can mint up to 10 keys from the sidebar (`api` button). A key looks like
@@ -109,3 +131,4 @@ and an optional `folder` field — same header, no chunking.
 | `NEBULA_QUOTA` | `1 TB` | per-account storage quota |
 | `NEBULA_BACKUP_EVERY` | `600` | database snapshot interval |
 | `NEBULA_INVITE` | unset | require an invite code to sign up |
+| `NEBULA_TRASH_DAYS` | `30` | days a trashed file is kept before automatic purge |
