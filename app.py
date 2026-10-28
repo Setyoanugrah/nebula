@@ -1103,9 +1103,7 @@ async def upload_finish(request):
             (user["id"], digest),
         ).fetchone()
         if dup and dup["msg_id"]:
-            wait = user_next.get(user["id"], 0) - time.time()
-            if wait > 2:
-                return JSONResponse({"retry": True, "wait": int(wait) + 1})
+            # dedup tidak menyentuh Telegram sama sekali, jadi tidak perlu kena jeda upload
             fid = secrets.token_hex(8)
             db.execute(
                 "INSERT INTO files(id,user_id,name,size,mime,msg_id,folder,created_at,status,hash)"
