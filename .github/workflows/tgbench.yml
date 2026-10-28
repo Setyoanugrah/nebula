@@ -43,7 +43,7 @@ jobs:
           STORE_KEY: ${{ secrets.NEBULA_STORE_KEY }}
           BENCH_MB: ${{ inputs.mb }}
           WORKERS: ${{ inputs.workers }}
-        run: python3 -u _tgbench.py
+        run: python3 -u tgbench.py
 
       - name: cleanup
         if: always()
