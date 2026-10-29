@@ -52,6 +52,9 @@ jobs:
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x /usr/local/bin/cloudflared
 
+      - name: cold start guard
+        run: sleep 45
+
       - name: Serve
         env:
           EDGE_TOKEN: ${{ secrets.NEBULA_EDGE_TOKEN }}
