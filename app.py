@@ -27,6 +27,19 @@ from starlette.responses import (
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
+from agent_store import (
+    AgentLeaseConflict,
+    AgentStateConflict,
+    AgentValueInvalid,
+    AgentValueTooLarge,
+    acquire_agent_lease,
+    get_agent_lease,
+    get_agent_state,
+    init_agent_schema,
+    put_agent_state,
+    release_agent_lease,
+    renew_agent_lease,
+)
 from store import (
     Client,
     InputFileBig,
@@ -114,6 +127,7 @@ def open_db():
     db = sqlite3.connect(DB_PATH, check_same_thread=False)
     db.row_factory = sqlite3.Row
     db.executescript(SCHEMA)
+    init_agent_schema(db)
 
 
 def reopen_db():
@@ -420,6 +434,126 @@ def rate_limited(key, limit, window):
 
 def json_err(msg, code=400):
     return JSONResponse({"error": msg}, status_code=code)
+
+
+AGENT_ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,100}")
+
+
+def valid_agent_id(value):
+    return bool(AGENT_ID_RE.fullmatch(value or ""))
+
+
+async def agent_json_body(request):
+    try:
+        body = await request.json()
+    except (ValueError, UnicodeError, RecursionError):
+        return None
+    return body if isinstance(body, dict) else None
+
+
+def valid_holder_ttl(body, require_ttl=True):
+    holder_id = body.get("holder_id")
+    if not isinstance(holder_id, str) or not holder_id or len(holder_id) > 160:
+        return None
+    try:
+        holder_id.encode("utf-8")
+    except UnicodeError:
+        return None
+    if not require_ttl:
+        return holder_id, None
+    ttl = body.get("ttl_seconds")
+    if isinstance(ttl, bool) or not isinstance(ttl, int) or not 30 <= ttl <= 600:
+        return None
+    return holder_id, ttl
+
+
+async def agent_state_endpoint(request):
+    user = current_user(request)
+    if not user:
+        return json_err("unauthorized", 401)
+    key = request.path_params["key"]
+    if not valid_agent_id(key):
+        return json_err("invalid state key")
+    if request.method == "GET":
+        state = get_agent_state(db, user["id"], key)
+        if not state:
+            return json_err("not found", 404)
+        return JSONResponse(state)
+    if key_scope(request) == "read":
+        return readonly_blocked(request)
+    body = await agent_json_body(request)
+    if body is None or "version" not in body or "value" not in body:
+        return json_err("body must contain version and value")
+    version = body["version"]
+    if version is not None and (isinstance(version, bool) or not isinstance(version, int)):
+        return json_err("version must be an integer or null")
+    try:
+        state = put_agent_state(db, user["id"], key, version, body["value"], int(time.time()))
+    except AgentStateConflict as exc:
+        return JSONResponse(
+            {"error": "version conflict", "current_version": exc.current_version},
+            status_code=409,
+        )
+    except AgentValueTooLarge:
+        return json_err("serialized value exceeds 4 MiB", 413)
+    except AgentValueInvalid:
+        return json_err("value must be valid JSON")
+    return JSONResponse(state)
+
+
+async def agent_lease_get(request):
+    user = current_user(request)
+    if not user:
+        return json_err("unauthorized", 401)
+    name = request.path_params["name"]
+    if not valid_agent_id(name):
+        return json_err("invalid lease name")
+    lease = get_agent_lease(db, user["id"], name)
+    if not lease:
+        return json_err("not found", 404)
+    return JSONResponse(lease)
+
+
+async def agent_lease_write(request, action):
+    user = current_user(request)
+    if not user:
+        return json_err("unauthorized", 401)
+    if key_scope(request) == "read":
+        return readonly_blocked(request)
+    name = request.path_params["name"]
+    if not valid_agent_id(name):
+        return json_err("invalid lease name")
+    body = await agent_json_body(request)
+    values = valid_holder_ttl(body or {}, require_ttl=action != "release")
+    if not values:
+        if action == "release":
+            return json_err("holder_id must be a non-empty string of at most 160 characters")
+        return json_err("holder_id must be 1..160 characters and ttl_seconds must be 30..600")
+    holder_id, ttl = values
+    now = int(time.time())
+    try:
+        if action == "acquire":
+            acquired, lease = acquire_agent_lease(db, user["id"], name, holder_id, ttl, now)
+            return JSONResponse({"acquired": acquired, "lease": lease})
+        if action == "renew":
+            lease = renew_agent_lease(db, user["id"], name, holder_id, ttl, now)
+            return JSONResponse({"renewed": True, "lease": lease})
+        lease = release_agent_lease(db, user["id"], name, holder_id, now)
+        return JSONResponse({"released": True, "lease": lease})
+    except AgentLeaseConflict:
+        return json_err("lease is not held by holder", 409)
+
+
+async def agent_lease_acquire(request):
+    return await agent_lease_write(request, "acquire")
+
+
+async def agent_lease_renew(request):
+    return await agent_lease_write(request, "renew")
+
+
+async def agent_lease_release(request):
+    return await agent_lease_write(request, "release")
 
 
 class Tg:
@@ -1636,6 +1770,11 @@ app = Starlette(
         Route("/api/login", login, methods=["POST"]),
         Route("/api/logout", logout, methods=["POST"]),
         Route("/api/me", me),
+        Route("/api/agent/state/{key}", agent_state_endpoint, methods=["GET", "PUT"]),
+        Route("/api/agent/lease/{name}/acquire", agent_lease_acquire, methods=["POST"]),
+        Route("/api/agent/lease/{name}/renew", agent_lease_renew, methods=["POST"]),
+        Route("/api/agent/lease/{name}/release", agent_lease_release, methods=["POST"]),
+        Route("/api/agent/lease/{name}", agent_lease_get, methods=["GET"]),
         Route("/api/files", list_files),
         Route("/api/upload", upload, methods=["POST"]),
         Route("/api/upload/init", upload_init, methods=["POST"]),

@@ -121,6 +121,26 @@ def upload(path, folder=""):
 Small files can go through `POST /api/upload` as `multipart/form-data` with a `files` field
 and an optional `folder` field — same header, no chunking.
 
+## Agent state and leases
+
+Agent data is private to the authenticated account. Sessions and `full` API keys may write;
+`read` keys may only use the GET endpoints. State and lease names must match
+`[A-Za-z0-9._:-]{1,100}`.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/agent/state/{key}` | read the current JSON value and version |
+| `PUT` | `/api/agent/state/{key}` | CAS write with `{"version":null,"value":...}`; use the returned version on updates |
+| `GET` | `/api/agent/lease/{name}` | read a lease |
+| `POST` | `/api/agent/lease/{name}/acquire` | acquire or contend with `{"holder_id":"worker-1","ttl_seconds":60}` |
+| `POST` | `/api/agent/lease/{name}/renew` | renew the current holder with the same body shape |
+| `POST` | `/api/agent/lease/{name}/release` | release with `{"holder_id":"worker-1"}` |
+
+State values are limited to 4 MiB after JSON serialization. A state create requires a null
+version; updates require the exact current version and return `409` with `current_version` on
+conflict. Lease TTLs are 30 to 600 seconds. Acquire always returns `200`; check `acquired` to
+distinguish ownership from contention.
+
 ## Environment
 
 | Variable | Default | Purpose |
