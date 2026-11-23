@@ -27,6 +27,11 @@ from starlette.responses import (
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
+from agent_public_status import (
+    allowed_public_status_origin,
+    build_agent_public_status,
+    read_agent_public_snapshot,
+)
 from agent_store import (
     AgentLeaseConflict,
     AgentStateConflict,
@@ -465,6 +470,37 @@ def valid_holder_ttl(body, require_ttl=True):
     if isinstance(ttl, bool) or not isinstance(ttl, int) or not 30 <= ttl <= 600:
         return None
     return holder_id, ttl
+
+
+def agent_public_status_headers(request):
+    headers = {
+        "Cache-Control": "no-store",
+        "Vary": "Origin",
+    }
+    origin = allowed_public_status_origin(request.headers.get("origin"))
+    if origin:
+        headers.update(
+            {
+                "Access-Control-Allow-Origin": origin,
+                "Access-Control-Allow-Methods": "GET, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type",
+            }
+        )
+    return headers
+
+
+async def agent_public_status_endpoint(request):
+    headers = agent_public_status_headers(request)
+    if request.method == "OPTIONS":
+        return Response(status_code=204, headers=headers)
+
+    now = int(time.time())
+    try:
+        value, updated_at, lease = read_agent_public_snapshot(db)
+        payload = build_agent_public_status(value, updated_at, lease, now)
+    except Exception:  # noqa: BLE001
+        payload = build_agent_public_status(None, None, None, now, ok=False)
+    return JSONResponse(payload, headers=headers)
 
 
 async def agent_state_endpoint(request):
@@ -1770,6 +1806,7 @@ app = Starlette(
         Route("/api/login", login, methods=["POST"]),
         Route("/api/logout", logout, methods=["POST"]),
         Route("/api/me", me),
+        Route("/api/agent/public-status", agent_public_status_endpoint, methods=["GET", "OPTIONS"]),
         Route("/api/agent/state/{key}", agent_state_endpoint, methods=["GET", "PUT"]),
         Route("/api/agent/lease/{name}/acquire", agent_lease_acquire, methods=["POST"]),
         Route("/api/agent/lease/{name}/renew", agent_lease_renew, methods=["POST"]),
