@@ -120,14 +120,14 @@ class AgentWebTests(unittest.TestCase):
         after = agent_web.read_newest_agent_state(self.conn)["value"]
         self.assertEqual(after["approvals"][0]["status"], "rejected")
 
-    def test_new_session_filters_old_messages_but_keeps_tasks(self):
+    def test_new_session_filters_old_messages_and_tasks(self):
         first = agent_web.create_web_task(self.conn, "old question", now=200)
         agent_web.reset_web_session_db(self.conn, now=300)
         second = agent_web.create_web_task(self.conn, "new question", now=400)
 
         conversation = agent_web.read_web_conversation(self.conn)
         self.assertEqual([item["content"] for item in conversation["messages"]], ["new question"])
-        self.assertIn(first["id"], [item["id"] for item in conversation["tasks"]])
+        self.assertNotIn(first["id"], [item["id"] for item in conversation["tasks"]])
         self.assertIn(second["id"], [item["id"] for item in conversation["tasks"]])
 
     def test_open_task_limit(self):

@@ -217,7 +217,14 @@ def conversation_payload(state):
     messages.sort(key=lambda item: (_timestamp(item["created_at"]), item["id"]))
     messages = messages[-MAX_CONVERSATION_MESSAGES:]
 
-    tasks = [safe for safe in (_safe_task(task) for task in _web_tasks(state)) if safe]
+    tasks = []
+    for task in _web_tasks(state):
+        safe = _safe_task(task)
+        if not safe:
+            continue
+        if since is not None and (_timestamp(safe["created_at"]) < _timestamp(since)):
+            continue
+        tasks.append(safe)
     tasks.sort(key=lambda item: (_timestamp(item["updated_at"]), item["id"]), reverse=True)
     return {
         "messages": messages,
