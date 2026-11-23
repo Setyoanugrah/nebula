@@ -58,6 +58,7 @@ jobs:
       - name: Serve
         env:
           EDGE_TOKEN: ${{ secrets.NEBULA_EDGE_TOKEN }}
+          TRIXTOM_WEB_TOKEN: ${{ secrets.TRIXTOM_WEB_TOKEN }}
           NEBULA_TMP: /tmp/nebula
           NEBULA_BACKUP_EVERY: "300"
         run: |

@@ -148,6 +148,25 @@ presence booleans, and fixed provider labels; IDs and stored content are never i
 response is `Cache-Control: no-store`. Browser CORS is allowed for `https://trixtom.my.id` and
 `http://localhost[:port]` during development.
 
+## TrixAgent web chat
+
+The static console at `https://trixtom.my.id` can enqueue tasks for the same durable
+`trixagent` state used by Telegram. Set `TRIXTOM_WEB_TOKEN` on the Nebula workflow; the browser
+sends it as `Authorization: Bearer <token>` and keeps it in `sessionStorage` only.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/agent/web/conversation` | Recent web messages and tasks |
+| `POST` | `/api/agent/web/message` | Queue a task from `{"content":"..."}` |
+| `GET` | `/api/agent/web/task/{id}` | Safe task transcript |
+| `POST` | `/api/agent/web/task/{id}/cancel` | Cancel a web task and reject its approvals |
+| `POST` | `/api/agent/web/new` | Start a new web conversation without touching Telegram context |
+
+Web tasks use the `web:owner` chat id. They are persisted in the same state blob and picked up by
+the active runner's periodic queue kick. Risky tools still require inline approval in Telegram;
+the web console only observes the resulting state. Web routes reject missing configuration with
+`503` and do not expose state internals, checkpoints, tool arguments, or runner IDs.
+
 ## Environment
 
 | Variable | Default | Purpose |
@@ -159,3 +178,4 @@ response is `Cache-Control: no-store`. Browser CORS is allowed for `https://trix
 | `NEBULA_BACKUP_EVERY` | `600` | database snapshot interval |
 | `NEBULA_INVITE` | unset | require an invite code to sign up |
 | `NEBULA_TRASH_DAYS` | `30` | days a trashed file is kept before automatic purge |
+| `TRIXTOM_WEB_TOKEN` | unset | bearer token for the owner-only TrixAgent web chat |

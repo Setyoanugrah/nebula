@@ -27,6 +27,7 @@ from starlette.responses import (
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
+import agent_web
 from agent_public_status import (
     allowed_public_status_origin,
     build_agent_public_status,
@@ -66,6 +67,7 @@ QUOTA = int(os.environ.get("NEBULA_QUOTA", CFG.get("quota", 2 * 1024**3)))
 MAX_FILE = 2 * 1024**3 - 1024
 POW_BITS = int(os.environ.get("NEBULA_POW_BITS", "20"))
 INVITE = os.environ.get("NEBULA_INVITE", "")
+TRIXTOM_WEB_TOKEN = os.environ.get("TRIXTOM_WEB_TOKEN", "").strip()
 CHALLENGES = {}
 HITS = defaultdict(deque)
 COOKIE = "nd"
@@ -501,6 +503,124 @@ async def agent_public_status_endpoint(request):
     except Exception:  # noqa: BLE001
         payload = build_agent_public_status(None, None, None, now, ok=False)
     return JSONResponse(payload, headers=headers)
+
+
+def agent_web_headers(request):
+    headers = {
+        "Cache-Control": "no-store",
+        "Vary": "Origin",
+    }
+    origin = agent_web.allowed_web_origin(request.headers.get("origin"))
+    if origin:
+        headers.update(
+            {
+                "Access-Control-Allow-Origin": origin,
+                "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Trixom-Token",
+                "Access-Control-Max-Age": "600",
+            }
+        )
+    return headers
+
+
+def agent_web_error(message, code, headers):
+    return JSONResponse({"error": message}, status_code=code, headers=headers)
+
+
+def agent_web_authorized(request):
+    return agent_web.authorized_web_token(
+        agent_web.web_token_from_headers(request.headers),
+        TRIXTOM_WEB_TOKEN,
+    )
+
+
+def agent_web_guard(request, headers, write=False):
+    if not TRIXTOM_WEB_TOKEN:
+        return agent_web_error("web chat is not configured", 503, headers)
+    if not agent_web_authorized(request):
+        if rate_limited("agent-web-auth:" + client_ip(request), 20, 60):
+            return agent_web_error("too many authentication attempts", 429, headers)
+        return agent_web_error("unauthorized", 401, headers)
+    limit = 30 if write else 120
+    if rate_limited("agent-web:" + client_ip(request), limit, 60):
+        return agent_web_error("rate limit exceeded", 429, headers)
+    return None
+
+
+async def agent_web_conversation(request):
+    headers = agent_web_headers(request)
+    if request.method == "OPTIONS":
+        return Response(status_code=204, headers=headers)
+    blocked = agent_web_guard(request, headers)
+    if blocked:
+        return blocked
+    try:
+        payload = agent_web.read_web_conversation(db)
+    except agent_web.WebStateError as exc:
+        return agent_web_error(exc.message, exc.status_code, headers)
+    return JSONResponse(payload, headers=headers)
+
+
+async def agent_web_message(request):
+    headers = agent_web_headers(request)
+    if request.method == "OPTIONS":
+        return Response(status_code=204, headers=headers)
+    blocked = agent_web_guard(request, headers, write=True)
+    if blocked:
+        return blocked
+    body = await agent_json_body(request)
+    if body is None:
+        return agent_web_error("invalid JSON body", 400, headers)
+    try:
+        task = agent_web.create_web_task(db, body.get("content"))
+    except agent_web.WebStateError as exc:
+        return agent_web_error(exc.message, exc.status_code, headers)
+    return JSONResponse({"task": task}, status_code=202, headers=headers)
+
+
+async def agent_web_task(request):
+    headers = agent_web_headers(request)
+    if request.method == "OPTIONS":
+        return Response(status_code=204, headers=headers)
+    blocked = agent_web_guard(request, headers)
+    if blocked:
+        return blocked
+    try:
+        payload = agent_web.read_web_task(db, request.path_params["task_id"])
+    except agent_web.WebStateError as exc:
+        return agent_web_error(exc.message, exc.status_code, headers)
+    return JSONResponse(payload, headers=headers)
+
+
+async def agent_web_task_cancel(request):
+    headers = agent_web_headers(request)
+    if request.method == "OPTIONS":
+        return Response(status_code=204, headers=headers)
+    blocked = agent_web_guard(request, headers, write=True)
+    if blocked:
+        return blocked
+    task_id = request.path_params["task_id"]
+    if not agent_web.valid_task_id(task_id):
+        return agent_web_error("invalid task id", 400, headers)
+    try:
+        task = agent_web.cancel_web_task_db(db, task_id)
+    except agent_web.WebStateError as exc:
+        return agent_web_error(exc.message, exc.status_code, headers)
+    return JSONResponse({"task": task}, headers=headers)
+
+
+async def agent_web_new(request):
+    headers = agent_web_headers(request)
+    if request.method == "OPTIONS":
+        return Response(status_code=204, headers=headers)
+    blocked = agent_web_guard(request, headers, write=True)
+    if blocked:
+        return blocked
+    try:
+        started_at = agent_web.reset_web_session_db(db)
+    except agent_web.WebStateError as exc:
+        return agent_web_error(exc.message, exc.status_code, headers)
+    return JSONResponse({"ok": True, "session_started_at": started_at}, headers=headers)
 
 
 async def agent_state_endpoint(request):
@@ -1807,6 +1927,11 @@ app = Starlette(
         Route("/api/logout", logout, methods=["POST"]),
         Route("/api/me", me),
         Route("/api/agent/public-status", agent_public_status_endpoint, methods=["GET", "OPTIONS"]),
+        Route("/api/agent/web/conversation", agent_web_conversation, methods=["GET", "OPTIONS"]),
+        Route("/api/agent/web/message", agent_web_message, methods=["POST", "OPTIONS"]),
+        Route("/api/agent/web/new", agent_web_new, methods=["POST", "OPTIONS"]),
+        Route("/api/agent/web/task/{task_id}/cancel", agent_web_task_cancel, methods=["POST", "OPTIONS"]),
+        Route("/api/agent/web/task/{task_id}", agent_web_task, methods=["GET", "OPTIONS"]),
         Route("/api/agent/state/{key}", agent_state_endpoint, methods=["GET", "PUT"]),
         Route("/api/agent/lease/{name}/acquire", agent_lease_acquire, methods=["POST"]),
         Route("/api/agent/lease/{name}/renew", agent_lease_renew, methods=["POST"]),
